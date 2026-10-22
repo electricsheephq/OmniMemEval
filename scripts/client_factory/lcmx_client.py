@@ -173,14 +173,17 @@ class LcmxClient:
     def _config(self, user_id):
         from hermes_lcm.config import LCMConfig
 
+        retraction_delivery = env_str("LCMX_RETRACTION_DELIVERY")
+        optional = {"retraction_delivery": retraction_delivery} if retraction_delivery else {}
         if not self._embeddings:
             return LCMConfig(database_path=str(self._db_path(user_id)),
-                             embeddings_enabled=False)
+                             embeddings_enabled=False, **optional)
         return LCMConfig(
             database_path=str(self._db_path(user_id)),
             embeddings_enabled=True,
             embedding_provider=self._provider_name,
             embedding_model=self._model,
+            **optional,
         )
 
     def _open(self, user_id):
@@ -373,6 +376,8 @@ class LcmxClient:
             if hit.get("kind") == "summary":
                 prefix += "(session summary) "
             lines.append(prefix + text)
+            for note in hit.get("annotations") or []:
+                lines.append(f"  {note}")
         return "\n".join(lines)
 
     # -- delete ---------------------------------------------------------------
