@@ -589,6 +589,8 @@ def search_conversation(
 
     client = create_client(frame)
     extra_kw = {"question_date": question_date}
+    if frame == "lcmx":
+        client.set_search_results_dir(_results_dir(frame, version))
 
     print("-" * 80)
     print(f"Searching conversation {conv_idx}")

@@ -359,6 +359,8 @@ def process_user(
     from client_factory import create_client
 
     client = create_client(frame)
+    if frame == "lcmx":
+        client.set_search_results_dir(f"results/locomo/{frame}-{version}")
 
     metadata = {
         "speaker_a": speaker_a,

@@ -163,6 +163,8 @@ def process_user(
     from client_factory import create_client
 
     client = create_client(frame)
+    if frame == "lcmx":
+        client.set_search_results_dir(f"results/pmv2/{frame}-{version}")
 
     try:
         result = dispatch_search(frame, client, question, memory_user_id, top_k)

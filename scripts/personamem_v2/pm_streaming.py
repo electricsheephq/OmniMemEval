@@ -329,6 +329,8 @@ def search_persona_rows(
     memory_user_id = user_id_for(version, persona_id)
     client = create_client(frame)
     durations: list[float] = []
+    if frame == "lcmx":
+        client.set_search_results_dir(_results_dir(frame, version))
     for row_idx, row_data in rows:
         tmp_path = _row_tmp_path(frame, version, row_idx)
         if tmp_path.exists():

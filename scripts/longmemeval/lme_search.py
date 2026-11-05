@@ -72,6 +72,8 @@ def process_user(
     from client_factory import create_client
 
     client = create_client(frame)
+    if frame == "lcmx":
+        client.set_search_results_dir(f"results/lme/{frame}-{version}")
     extra_kw = {"question_date": question_date}
     try:
         result = dispatch_search(frame, client, question, user_id, top_k, **extra_kw)

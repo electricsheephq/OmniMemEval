@@ -22,7 +22,23 @@ _EMBEDDER_LOCK = threading.Lock()
 _USER_LOCKS = {}
 _USER_LOCKS_GUARD = threading.Lock()
 _RECALL_LOCK = threading.RLock()
-_SEARCH_STATES = {}
+_ABORT = threading.Event()
+_ABORT_MESSAGE = None
+_ABORT_LOCK = threading.Lock()
+
+
+def _abort(message, *, rebuild=False):
+    global _ABORT_MESSAGE
+    with _ABORT_LOCK:
+        if not _ABORT.is_set():
+            _ABORT_MESSAGE = str(message) + ("; re-ingest with --clear / --restart-unit" if rebuild else "")
+            _ABORT.set()
+    raise SystemExit(_ABORT_MESSAGE)
+
+
+def _check_abort():
+    if _ABORT.is_set():
+        _abort(_ABORT_MESSAGE)
 
 
 def _safe(value):
@@ -206,6 +222,7 @@ class LcmxClient:
             timestamp: Optional ISO-8601 event time used when a message has
                 no ``chat_time``.
         """
+        _check_abort()
         if not messages:
             return
         session_key = (
@@ -225,7 +242,11 @@ class LcmxClient:
         from hermes_lcm.vector_store import EmbeddingIdentity
 
         with _user_lock(user_id):
+            _check_abort()
             self._require_healthy_store(user_id)
+            self._user_dir(user_id).mkdir(parents=True, exist_ok=True)
+            atomic_json_dump({"status": "failed", "phase": "ingest"},
+                             self._user_dir(user_id) / "embedding_catchup.json", indent=2)
             sessions = self._load_sessions(user_id)
             order = len(sessions) + 1
             session_id = str(session_key) if session_key else f"{_safe(user_id)}-s{order}"
@@ -293,19 +314,24 @@ class LcmxClient:
                     vector_store.record_embedding(
                         str(node_id), "summary", self._model, summary_vector, identity=identity
                     )
+                sessions[session_id] = {"order": order, "time": session_time}
+                atomic_json_dump(sessions, self._sessions_path(user_id))
+            except Exception as exc:  # noqa: BLE001 - make ingestion failures fatal
+                # Ingest exceptions abort both arms: the pending marker would refuse a re-add.
+                _abort(f"LCM-X ingest failed: {type(exc).__name__}", rebuild=True)
             finally:
                 vector_store.close()
                 dag.close()
                 store.close()
 
             self._catch_up(user_id, config)
-            sessions[session_id] = {"order": order, "time": session_time}
-            self._sessions_path(user_id).write_text(json.dumps(sessions), encoding="utf-8")
 
     def _require_healthy_store(self, user_id):
         path = self._user_dir(user_id) / "embedding_catchup.json"
-        if path.exists() and json.loads(path.read_text()).get("status") == "failed":
-            raise SystemExit("LCM-X store failed catch-up; re-ingest with --clear / --restart-unit")
+        if path.exists():
+            marker = json.loads(path.read_text())
+            if marker.get("status") == "failed":
+                _abort(f"LCM-X store failed during {marker.get('phase', 'catch-up')}", rebuild=True)
 
     def _catchup_receipts(self, user_id):
         # Read only receipts for the active identities, never an older profile.
@@ -355,12 +381,13 @@ class LcmxClient:
             atomic_json_dump(report, path, indent=2)
             previous = progress_state(self._catchup_receipts(user_id))
             while count < limit:
+                _check_abort()
                 outcome = maintenance.run_incremental_embedding_pass(db, config)
                 report.update(passes=report["passes"] + 1, outcome=outcome)
                 if outcome in {"lease_held", "model_preparing"} or str(outcome).endswith("=lease_held"):
                     retry_deadline = retry_deadline or time.monotonic() + 600
                     if time.monotonic() >= retry_deadline:
-                        raise SystemExit("LCM-X catch-up retry exceeded 600s")
+                        _abort("LCM-X catch-up retry exceeded 600s", rebuild=True)
                     time.sleep(min(5, retry_deadline - time.monotonic()))
                     continue
                 count += 1
@@ -376,21 +403,24 @@ class LcmxClient:
                 idle = idle + 1 if not writes and snapshot == previous else 0
                 previous = snapshot
                 if idle >= 20:
-                    raise SystemExit("LCM-X catch-up stalled for 20 passes")
+                    _abort("LCM-X catch-up stalled for 20 passes", rebuild=True)
                 # The pass does not raise on failures. Reject refusals and errors;
                 # only bounded partial/complete work may need another pass.
                 if not re.fullmatch(r"summaries=(?:complete|partial):\d+ chunks=(?:complete|partial):\d+", str(outcome)):
-                    raise SystemExit(f"LCM-X embedding catch-up failed: {outcome}")
-            raise SystemExit(f"LCM-X embedding catch-up incomplete after {limit} passes")
-        except Exception as exc:
-            raise SystemExit(f"LCM-X embedding catch-up failed: {type(exc).__name__}") from exc
+                    _abort(f"LCM-X embedding catch-up failed: {outcome}", rebuild=True)
+            _abort(f"LCM-X embedding catch-up incomplete after {limit} passes", rebuild=True)
+        except Exception as exc:  # noqa: BLE001 - make maintenance failures fatal
+            _abort(f"LCM-X embedding catch-up failed: {type(exc).__name__}", rebuild=True)
         finally:
             atomic_json_dump(report, path, indent=2)
+
+    def set_search_results_dir(self, path):
+        self._search_status_path = Path(path) / "lcmx_recall_status.json"
 
     def _record_search_payload(self, user_id, payload):
         reason = payload.get("degraded_reason")
         coverage = payload.get("provenance", {}).get("coverage", {})
-        degraded = self._embeddings and bool(
+        degraded = "error" in payload or self._embeddings and bool(
             payload.get("degraded") or reason or payload.get("timeout")
             or any(coverage.get(arm) in {"none", "disabled"} for arm in ("summary", "chunk"))
         )
@@ -402,14 +432,17 @@ class LcmxClient:
             report["payloads"] += 1
             report["degraded_payloads"] += int(degraded)
             atomic_json_dump(report, path, indent=2)
-        stage = _SEARCH_STATES.setdefault(str(self._db_root), {"stage": "search", "payloads": 0, "degraded_payloads": 0})
+        # Count issued payloads cumulatively across resumes/retries, retaining aborted-run degradation.
+        path = getattr(self, "_search_status_path", self._db_root / "search_status.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stage = json.loads(path.read_text()) if path.exists() else {"stage": "search", "payloads": 0, "degraded_payloads": 0}
         stage["payloads"] += 1
         stage["degraded_payloads"] += int(degraded)
-        atomic_json_dump(stage, self._db_root / "search_status.json", indent=2)
-        if degraded:
+        atomic_json_dump(stage, path, indent=2)
+        if degraded and self._embeddings:
             # Stage wrappers can turn Exception into a skipped question. This
             # invalidates the whole benchmark stage, even with skip flags set.
-            raise SystemExit(
+            _abort(
                 f"LCM-X degraded recall: {report['degraded_payloads']} degraded payload(s): {reason}"
             )
 
@@ -417,14 +450,14 @@ class LcmxClient:
 
     def search(self, query, user_id, top_k):
         """Run ``lcm_recall`` and return one ``[event_time] text`` line per hit."""
+        _check_abort()
+        self._require_healthy_store(user_id)
         if not self._db_path(user_id).exists():
+            if self._embeddings:
+                _abort("LCM-X semantic search store missing; ingest first", rebuild=True)
             return ""
         import hermes_lcm.tools as lcm_tools
 
-        self._require_healthy_store(user_id)
-        with _RECALL_LOCK:
-            if self._embeddings and _SEARCH_STATES.get(str(self._db_root), {}).get("degraded_payloads"):
-                raise SystemExit("LCM-X search stage already aborted")
         config, store, dag, vector_store = self._open(user_id)
         try:
             engine = SimpleNamespace(
@@ -443,8 +476,7 @@ class LcmxClient:
             if self._scope_bias:
                 args["scope_bias"] = float(self._scope_bias)
             with _RECALL_LOCK:
-                if self._embeddings and _SEARCH_STATES.get(str(self._db_root), {}).get("degraded_payloads"):
-                    raise SystemExit("LCM-X search stage already aborted")
+                _check_abort()
                 payload = json.loads(lcm_tools.lcm_recall(args, engine=engine))
                 self._record_search_payload(user_id, payload)
             # Recall snippets are cut at 300 chars; deliver the full stored

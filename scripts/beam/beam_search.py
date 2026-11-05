@@ -163,6 +163,8 @@ def process_conversation(
     from client_factory import create_client
 
     client = create_client(frame)
+    if frame == "lcmx":
+        client.set_search_results_dir(f"results/beam/{frame}-{version}")
 
     tmp_dir = f"results/beam/{frame}-{version}/tmp"
     os.makedirs(tmp_dir, exist_ok=True)

@@ -1,19 +1,28 @@
 """Real LME stage wiring with fake recall/model calls; no weights or downloads."""
 
 import asyncio
+import copy
 import importlib.util
 import json
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import client_factory
+import client_factory.lcmx_client as adapter_module
 import pandas as pd
 import pytest
 from client_factory.lcmx_client import LcmxClient
 from longmemeval import lme_responses, lme_search, lme_streaming
 from longmemeval.lme_common import user_id_for
+
+
+@pytest.fixture(autouse=True)
+def fresh_abort_state(monkeypatch):
+    monkeypatch.setattr(adapter_module, "_ABORT", threading.Event())
+    monkeypatch.setattr(adapter_module, "_ABORT_MESSAGE", None)
 
 
 @pytest.fixture
@@ -116,7 +125,7 @@ def test_search_stage_skip_flag_cannot_accept_timeout_or_run_queued_recalls(tmp_
     with pytest.raises(SystemExit):
         lme_search.main("lcmx", "abort", num_workers=workers, skip_failed_search=True)
     tools.lcm_recall.assert_called_once()
-    assert json.loads((adapter._db_root / "search_status.json").read_text()) == {
+    assert json.loads((tmp_path / "results/lme/lcmx-abort/lcmx_recall_status.json").read_text()) == {
         "stage": "search", "payloads": 1, "degraded_payloads": 1,
     }
 
@@ -159,3 +168,46 @@ def test_example_env_preserves_job_cache_values(tmp_path, monkeypatch):
     import os
 
     assert all(os.environ[name] == "/job/copied/cache" for name in cache_names)
+
+
+def test_resumed_search_merges_counts_next_to_results_for_disjoint_questions(tmp_path, monkeypatch, dataframe):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(lme_search, "load_env", lambda: None)
+    dataframe["question"] = ["first question", "second question"]
+    adapter = LcmxClient.__new__(LcmxClient)
+    adapter._db_root = tmp_path / "stores"
+    adapter._embeddings = True
+    adapter._provider_name = "fastembed"
+    adapter._embedder = SimpleNamespace(model_id="test-model")
+    adapter._top_k_cap = 25
+    adapter._scope_bias = None
+    adapter._delivery = "full"
+    adapter._open = Mock(return_value=(object(), Mock(), Mock(), Mock()))
+    for idx in range(len(dataframe)):
+        user = user_id_for("resume", idx)
+        adapter._user_dir(user).mkdir(parents=True)
+        adapter._db_path(user).touch()
+    package = ModuleType("hermes_lcm")
+    package.__path__ = []
+    tools = ModuleType("hermes_lcm.tools")
+    tools.lcm_recall = Mock(return_value='{"hits":[]}')
+    package.tools = tools
+    monkeypatch.setitem(sys.modules, "hermes_lcm", package)
+    monkeypatch.setitem(sys.modules, "hermes_lcm.tools", tools)
+    monkeypatch.setattr(client_factory, "create_client", lambda frame: copy.copy(adapter))
+    monkeypatch.setattr(lme_search, "load_lme_dataframe", lambda: dataframe.head(1))
+    lme_search.main("lcmx", "resume", num_workers=1)
+    folder = tmp_path / "results/lme/lcmx-resume"
+    path = folder / "lcmx_recall_status.json"
+    assert json.loads(path.read_text()) == {"stage": "search", "payloads": 1, "degraded_payloads": 0}
+    prior = json.loads(path.read_text())
+    prior["retained_metadata"] = "from earlier run"
+    path.write_text(json.dumps(prior))
+    monkeypatch.setattr(lme_search, "load_lme_dataframe", lambda: dataframe)
+    lme_search.main("lcmx", "resume", num_workers=1)
+    assert json.loads(path.read_text()) == {
+        "stage": "search", "payloads": 2, "degraded_payloads": 0, "retained_metadata": "from earlier run",
+    }
+    assert (folder / "lcmx_lme_search_results.json").is_file()
+    assert [call.args[0]["query"] for call in tools.lcm_recall.call_args_list] == ["first question", "second question"]
+    assert not (adapter._db_root / "search_status.json").exists()

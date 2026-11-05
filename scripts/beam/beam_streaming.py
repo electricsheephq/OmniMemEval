@@ -388,6 +388,8 @@ def search_conversation(
 
     client = create_client(frame)
     durations: list[float] = []
+    if frame == "lcmx":
+        client.set_search_results_dir(_results_dir(frame, version))
     for meta in question_meta:
         question_text = meta["question"].get("question", "")
         if question_text in existing_questions:

@@ -3,6 +3,8 @@
 import json
 import sqlite3
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,6 +12,12 @@ import client_factory.lcmx_client as adapter_module
 import pytest
 from client_factory.lcmx_client import LcmxClient
 from longmemeval.lme_common import build_search_result, write_question_id_map
+
+
+@pytest.fixture(autouse=True)
+def fresh_abort_state(monkeypatch):
+    monkeypatch.setattr(adapter_module, "_ABORT", threading.Event())
+    monkeypatch.setattr(adapter_module, "_ABORT_MESSAGE", None)
 
 
 @pytest.fixture
@@ -154,7 +162,7 @@ def test_search_counts_degraded_payload_and_aborts_before_delivery(client, paylo
     tools.lcm_recall = Mock(return_value=json.dumps(payload))
     with pytest.raises(SystemExit, match="1 degraded payload"):
         adapter.search("question", "u", 20)
-    with pytest.raises(SystemExit, match="stage already aborted"):
+    with pytest.raises(SystemExit, match="1 degraded payload"):
         adapter.search("next question", "u", 20)
     store.get_batch.assert_not_called()
     assert store.close.call_count == dag.close.call_count == vectors.close.call_count == 1
@@ -200,7 +208,8 @@ def test_add_runs_catchup_after_closing_ingest_handles(client, monkeypatch):
         assert user_id == "u" and supplied is config
         for handle in (store, dag, vectors):
             handle.close.assert_called_once()
-        assert not adapter._sessions_path("u").exists()
+        assert json.loads(adapter._sessions_path("u").read_text()) == {"u-s1": {"order": 1, "time": None}}
+        assert json.loads((adapter._user_dir("u") / "embedding_catchup.json").read_text())["status"] == "failed"
 
     adapter._catch_up = Mock(side_effect=catch_up)
     adapter.add([{"role": "user", "content": "text"}], "u")
@@ -261,8 +270,9 @@ def test_failed_catchup_refuses_readd_and_search_without_duplicate_writes(client
     store.append_batch.assert_called_once()
     dag.add_node.assert_called_once()
     vectors.record_embedding.assert_called_once()
-    assert not adapter._sessions_path("u").exists()
+    assert json.loads(adapter._sessions_path("u").read_text()) == {"s1": {"order": 1, "time": None}}
     adapter.delete_all("u")
+    adapter_module._ABORT.clear()  # A rebuilt store is used by a fresh harness process.
     adapter._user_dir("u").mkdir()
     seed_receipts(adapter)
     run.return_value = "summaries=complete:0 chunks=complete:0"
@@ -373,12 +383,168 @@ def test_vector_writes_reset_the_consecutive_stall_counter(client, monkeypatch):
     assert run.call_count == 58
 
 
-def test_full_text_mode_does_not_inherit_a_semantic_abort(client):
+def test_full_text_mode_respects_process_abort(client):
     adapter, tools, _ = client
     adapter._open = Mock(return_value=(object(), Mock(), Mock(), Mock()))
     tools.lcm_recall = Mock(return_value=json.dumps({"hits": [], "timeout": True}))
     with pytest.raises(SystemExit, match="degraded payload"):
         adapter.search("question", "u", 20)
     adapter._embeddings = False
+    with pytest.raises(SystemExit, match="degraded payload"):
+        adapter.search("question", "u", 20)
+    tools.lcm_recall.assert_called_once()
+    adapter_module._ABORT.clear()  # Simulate a new process: the in-memory abort flag is gone.
     assert adapter.search("question", "u", 20) == ""
     assert tools.lcm_recall.call_count == 2
+
+
+@pytest.fixture
+def ingest_client(client, monkeypatch):
+    adapter, tools, run = client
+    adapter._summary = lambda rows: "summary"
+    adapter._chunk_policy = "conversational"
+    adapter._dim = 1
+    adapter._embedder.embed_documents = Mock(return_value=[[1.0]])
+    for name in ("chunking", "dag", "vector_store"):
+        module = ModuleType(f"hermes_lcm.{name}")
+        module.iter_message_chunks = Mock(return_value=[])
+        module.SummaryNode = SimpleNamespace
+        module.EmbeddingIdentity = Mock()
+        monkeypatch.setitem(sys.modules, f"hermes_lcm.{name}", module)
+    store, dag, vectors = Mock(), Mock(), Mock()
+    store.append_batch.return_value = [1]
+    adapter._open = Mock(return_value=(object(), store, dag, vectors))
+    run.return_value = "summaries=complete:0 chunks=complete:0"
+    return adapter, tools, run, store, dag, vectors
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
+def test_embedding_exception_leaves_ingest_marker_and_refuses_readd_after_restart(ingest_client, failure):
+    adapter, _, run, store, dag, vectors = ingest_client
+    adapter._embedder.embed_documents.side_effect = failure("fake embed failure")
+    marker = adapter._user_dir("u") / "embedding_catchup.json"
+
+    def committed(*args, **kwargs):
+        assert json.loads(marker.read_text()) == {"status": "failed", "phase": "ingest"}
+        return [1]
+
+    store.append_batch.side_effect = committed
+    with pytest.raises(SystemExit if failure is RuntimeError else KeyboardInterrupt):
+        adapter.add([{"role": "user", "content": "text"}], "u", session_key="s1")
+    assert json.loads(marker.read_text()) == {"status": "failed", "phase": "ingest"}
+    assert adapter_module._ABORT.is_set() == (failure is RuntimeError)
+    run.assert_not_called()
+    adapter_module._ABORT.clear()  # Simulate a new process resuming the same on-disk store.
+    with pytest.raises(SystemExit, match="--clear / --restart-unit") as refusal:
+        adapter.add([{"role": "user", "content": "text"}], "u", session_key="s1")
+    assert "failed during ingest" in str(refusal.value)
+    store.append_batch.assert_called_once()
+    dag.add_node.assert_called_once()
+    vectors.record_embedding.assert_not_called()
+
+
+@pytest.mark.parametrize("embeddings,status", [(True, "complete"), (False, "not_applicable")])
+def test_clean_add_replaces_ingest_marker(ingest_client, embeddings, status):
+    adapter, _, run, store, _, _ = ingest_client
+    adapter._embeddings = embeddings
+    marker = adapter._user_dir("u") / "embedding_catchup.json"
+    seen = []
+    store.append_batch.side_effect = lambda *args, **kwargs: seen.append(json.loads(marker.read_text())) or [1]
+    adapter.add([{"role": "user", "content": "text"}], "u", session_key="s1")
+    assert seen == [{"status": "failed", "phase": "ingest"}]
+    assert json.loads(marker.read_text())["status"] == status
+    assert json.loads(adapter._sessions_path("u").read_text()) == {"s1": {"order": 1, "time": None}}
+    assert not adapter_module._ABORT.is_set()
+    assert run.call_count == int(embeddings)
+
+
+def test_queued_add_on_another_store_stops_after_catchup_abort(ingest_client):
+    adapter, _, run, store, _, _ = ingest_client
+    run.return_value = "error"
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first_job = executor.submit(adapter.add, [{"role": "user", "content": "text"}], "u", session_key="s1")
+        queued_job = executor.submit(adapter.add, [{"role": "user", "content": "text"}], "queued", session_key="s2")
+        with pytest.raises(SystemExit) as first:
+            first_job.result()
+        with pytest.raises(SystemExit) as queued:
+            queued_job.result()
+    assert queued.value.code == first.value.code
+    assert not adapter._user_dir("queued").exists()
+    store.append_batch.assert_called_once()
+    adapter._open.assert_called_once()
+
+
+@pytest.mark.parametrize("embeddings", [True, False])
+def test_error_payload_is_counted_as_not_clean(client, embeddings):
+    adapter, tools, _ = client
+    adapter._embeddings = embeddings
+    adapter._open = Mock(return_value=(object(), Mock(), Mock(), Mock()))
+    tools.lcm_recall = Mock(return_value='{"error":"fake recall error"}')
+    with pytest.raises(SystemExit if embeddings else RuntimeError):
+        adapter.search("question", "u", 20)
+    assert json.loads((adapter._db_root / "search_status.json").read_text()) == {
+        "stage": "search", "payloads": 1, "degraded_payloads": 1,
+    }
+    assert adapter_module._ABORT.is_set() == embeddings
+
+
+@pytest.mark.parametrize("embeddings", [True, False])
+def test_missing_store_cannot_return_empty_after_abort(client, embeddings):
+    adapter, tools, _ = client
+    adapter._embeddings = embeddings
+    tools.lcm_recall = Mock()
+    with pytest.raises(SystemExit):
+        adapter_module._abort("first abort")
+    with pytest.raises(SystemExit, match="first abort"):
+        adapter.search("question", "missing", 20)
+    tools.lcm_recall.assert_not_called()
+
+
+def test_semantic_missing_store_aborts_and_full_text_missing_store_is_empty(client):
+    adapter, tools, _ = client
+    tools.lcm_recall = Mock()
+    adapter._embeddings = False
+    assert adapter.search("question", "missing", 20) == ""
+    adapter._embeddings = True
+    with pytest.raises(SystemExit, match="store missing; ingest first"):
+        adapter.search("question", "missing", 20)
+    assert adapter_module._ABORT.is_set()
+    tools.lcm_recall.assert_not_called()
+
+
+def test_sessions_write_failure_leaves_marker_pending_and_refuses_readd(ingest_client, monkeypatch):
+    adapter, _, run, store, _, _ = ingest_client
+    original_dump = adapter_module.atomic_json_dump
+    marker_path = adapter._user_dir("u") / "embedding_catchup.json"
+
+    def fail_sessions(data, path, **kwargs):
+        if path == adapter._sessions_path("u"):
+            assert json.loads(marker_path.read_text()) == {"status": "failed", "phase": "ingest"}
+            raise OSError("injected sessions write failure")
+        return original_dump(data, path, **kwargs)
+
+    monkeypatch.setattr(adapter_module, "atomic_json_dump", fail_sessions)
+    with pytest.raises(SystemExit, match="ingest failed"):
+        adapter.add([{"role": "user", "content": "text"}], "u", session_key="s1")
+    assert json.loads(marker_path.read_text()) == {"status": "failed", "phase": "ingest"}
+    assert not adapter._sessions_path("u").exists()
+    run.assert_not_called()
+    adapter_module._ABORT.clear()  # A new process must still refuse the pending store.
+    with pytest.raises(SystemExit, match="failed during ingest.*--clear / --restart-unit"):
+        adapter.add([{"role": "user", "content": "text"}], "u", session_key="s1")
+    store.append_batch.assert_called_once()
+
+
+def test_off_arm_ingest_exception_aborts_and_leaves_pending_marker(ingest_client, monkeypatch):
+    adapter, _, run, store, _, _ = ingest_client
+    monkeypatch.setenv("LCMX_CONFIG", "off")
+    adapter._embeddings = False
+    store.append_batch.side_effect = RuntimeError("injected ingest failure")
+    with pytest.raises(SystemExit, match="ingest failed.*--clear / --restart-unit"):
+        adapter.add([{"role": "user", "content": "text"}], "u", session_key="s1")
+    assert adapter_module._ABORT.is_set()
+    assert json.loads((adapter._user_dir("u") / "embedding_catchup.json").read_text()) == {
+        "status": "failed", "phase": "ingest",
+    }
+    run.assert_not_called()
+    adapter._embedder.embed_documents.assert_not_called()
