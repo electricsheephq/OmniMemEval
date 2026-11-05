@@ -2,13 +2,16 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from .base_client import env_int, env_str, require_env
+from utils.checkpoint import atomic_json_dump
 
+from .base_client import env_int, env_str, require_env
 
 _DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
 
@@ -18,7 +21,8 @@ _EMBEDDER = None
 _EMBEDDER_LOCK = threading.Lock()
 _USER_LOCKS = {}
 _USER_LOCKS_GUARD = threading.Lock()
-_WARNED = set()
+_RECALL_LOCK = threading.RLock()
+_SEARCH_STATES = {}
 
 
 def _safe(value):
@@ -85,6 +89,9 @@ class LcmxClient:
                                turns under 40 tokens) or "full" (every message)
         LCMX_DELIVERY        – "full" (default): full stored message per hit;
                                "snippet": lcm_recall's 300-char snippet
+        LCMX_CATCHUP_MAX_PASSES – maintenance pass limit (default: 500)
+        FASTEMBED_CACHE_PATH / LCM_LONGMEMEVAL_FASTEMBED_CACHE – model cache
+        TIKTOKEN_CACHE_DIR  – populated tokenizer cache (set by the job)
     """
 
     def __init__(self):
@@ -218,6 +225,7 @@ class LcmxClient:
         from hermes_lcm.vector_store import EmbeddingIdentity
 
         with _user_lock(user_id):
+            self._require_healthy_store(user_id)
             sessions = self._load_sessions(user_id)
             order = len(sessions) + 1
             session_id = str(session_key) if session_key else f"{_safe(user_id)}-s{order}"
@@ -290,8 +298,120 @@ class LcmxClient:
                 dag.close()
                 store.close()
 
+            self._catch_up(user_id, config)
             sessions[session_id] = {"order": order, "time": session_time}
             self._sessions_path(user_id).write_text(json.dumps(sessions), encoding="utf-8")
+
+    def _require_healthy_store(self, user_id):
+        path = self._user_dir(user_id) / "embedding_catchup.json"
+        if path.exists() and json.loads(path.read_text()).get("status") == "failed":
+            raise SystemExit("LCM-X store failed catch-up; re-ingest with --clear / --restart-unit")
+
+    def _catchup_receipts(self, user_id):
+        # Read only receipts for the active identities, never an older profile.
+        db = self._db_path(user_id).resolve()
+        conn = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True)
+        try:
+            records = {}
+            for task in ("summary", "chunk"):
+                row = conn.execute(
+                    "SELECT m.value FROM lcm_embedding_profile p JOIN metadata m "
+                    "ON m.key = 'embedding_catchup:' || ? || ':' || p.identity_hash "
+                    "WHERE p.active=1 AND p.archived_at IS NULL "
+                    "AND replace(p.task, '+prefix', '')=? AND p.provider=? "
+                    "AND p.model_name=? AND CASE WHEN instr(p.revision, '+prefix:')=0 "
+                    "THEN '' ELSE substr(p.revision, instr(p.revision, '+prefix:')) END=? "
+                    "ORDER BY p.registered_at DESC LIMIT 1",
+                    (task, task, self._provider_name, self._model,
+                     getattr(self._embedder, "identity_revision_suffix", "")),
+                ).fetchone()
+                records[task] = json.loads(row[0]) if row else {}
+            return records
+        finally:
+            conn.close()
+
+    def _catch_up(self, user_id, config):
+        import hermes_lcm.tools as lcm_tools
+
+        path = self._user_dir(user_id) / "embedding_catchup.json"
+        report = {"status": "not_applicable", "passes": 0}
+        if not hasattr(lcm_tools, "_lcm_recall_catchup_reason") or not self._embeddings:
+            report["reason"] = "no_receipt_gate" if self._embeddings else "embeddings_disabled"
+            atomic_json_dump(report, path, indent=2)
+            return
+        from hermes_lcm import command
+        from hermes_lcm import embedding_maintenance as maintenance
+
+        report["status"] = "failed"
+        limit = env_int("LCMX_CATCHUP_MAX_PASSES", 500, min_value=1)
+        db = str(self._db_path(user_id))
+        idle, count, retry_deadline = 0, 0, None
+
+        def progress_state(receipts):
+            return ({k: {f: v for f, v in r.items() if f != "updated_at"}
+                     for k, r in receipts.items()}, maintenance._scan_frontier(db, command))
+
+        try:
+            atomic_json_dump(report, path, indent=2)
+            previous = progress_state(self._catchup_receipts(user_id))
+            while count < limit:
+                outcome = maintenance.run_incremental_embedding_pass(db, config)
+                report.update(passes=report["passes"] + 1, outcome=outcome)
+                if outcome in {"lease_held", "model_preparing"} or str(outcome).endswith("=lease_held"):
+                    retry_deadline = retry_deadline or time.monotonic() + 600
+                    if time.monotonic() >= retry_deadline:
+                        raise SystemExit("LCM-X catch-up retry exceeded 600s")
+                    time.sleep(min(5, retry_deadline - time.monotonic()))
+                    continue
+                count += 1
+                retry_deadline = None
+                receipts = self._catchup_receipts(user_id)
+                report["receipts"] = receipts
+                complete = re.fullmatch(r"summaries=complete:\d+ chunks=complete:\d+", str(outcome))
+                if complete and all(r.get("remaining") == 0 and not r.get("operator_retry") for r in receipts.values()):
+                    report["status"] = "complete"
+                    return
+                snapshot = progress_state(receipts)
+                writes = sum(int(n) for n in re.findall(r":(\d+)(?: |$)", str(outcome)))
+                idle = idle + 1 if not writes and snapshot == previous else 0
+                previous = snapshot
+                if idle >= 20:
+                    raise SystemExit("LCM-X catch-up stalled for 20 passes")
+                # The pass does not raise on failures. Reject refusals and errors;
+                # only bounded partial/complete work may need another pass.
+                if not re.fullmatch(r"summaries=(?:complete|partial):\d+ chunks=(?:complete|partial):\d+", str(outcome)):
+                    raise SystemExit(f"LCM-X embedding catch-up failed: {outcome}")
+            raise SystemExit(f"LCM-X embedding catch-up incomplete after {limit} passes")
+        except Exception as exc:
+            raise SystemExit(f"LCM-X embedding catch-up failed: {type(exc).__name__}") from exc
+        finally:
+            atomic_json_dump(report, path, indent=2)
+
+    def _record_search_payload(self, user_id, payload):
+        reason = payload.get("degraded_reason")
+        coverage = payload.get("provenance", {}).get("coverage", {})
+        degraded = self._embeddings and bool(
+            payload.get("degraded") or reason or payload.get("timeout")
+            or any(coverage.get(arm) in {"none", "disabled"} for arm in ("summary", "chunk"))
+        )
+        with _user_lock(user_id):
+            path = self._user_dir(user_id) / "recall_status.json"
+            report = json.loads(path.read_text()) if path.exists() else {
+                "payloads": 0, "degraded_payloads": 0,
+            }
+            report["payloads"] += 1
+            report["degraded_payloads"] += int(degraded)
+            atomic_json_dump(report, path, indent=2)
+        stage = _SEARCH_STATES.setdefault(str(self._db_root), {"stage": "search", "payloads": 0, "degraded_payloads": 0})
+        stage["payloads"] += 1
+        stage["degraded_payloads"] += int(degraded)
+        atomic_json_dump(stage, self._db_root / "search_status.json", indent=2)
+        if degraded:
+            # Stage wrappers can turn Exception into a skipped question. This
+            # invalidates the whole benchmark stage, even with skip flags set.
+            raise SystemExit(
+                f"LCM-X degraded recall: {report['degraded_payloads']} degraded payload(s): {reason}"
+            )
 
     # -- search ---------------------------------------------------------------
 
@@ -301,6 +421,10 @@ class LcmxClient:
             return ""
         import hermes_lcm.tools as lcm_tools
 
+        self._require_healthy_store(user_id)
+        with _RECALL_LOCK:
+            if self._embeddings and _SEARCH_STATES.get(str(self._db_root), {}).get("degraded_payloads"):
+                raise SystemExit("LCM-X search stage already aborted")
         config, store, dag, vector_store = self._open(user_id)
         try:
             engine = SimpleNamespace(
@@ -318,7 +442,11 @@ class LcmxClient:
             args = {"query": query, "limit": min(int(top_k), self._top_k_cap)}
             if self._scope_bias:
                 args["scope_bias"] = float(self._scope_bias)
-            payload = json.loads(lcm_tools.lcm_recall(args, engine=engine))
+            with _RECALL_LOCK:
+                if self._embeddings and _SEARCH_STATES.get(str(self._db_root), {}).get("degraded_payloads"):
+                    raise SystemExit("LCM-X search stage already aborted")
+                payload = json.loads(lcm_tools.lcm_recall(args, engine=engine))
+                self._record_search_payload(user_id, payload)
             # Recall snippets are cut at 300 chars; deliver the full stored
             # message for message hits (LCMX_DELIVERY=snippet restores the cut).
             full_rows = {}
@@ -333,14 +461,6 @@ class LcmxClient:
 
         if "error" in payload:
             raise RuntimeError(f"lcm_recall error: {payload['error']}")
-        reason = payload.get("degraded_reason")
-        if payload.get("degraded") and self._embeddings and reason not in _WARNED:
-            # Logged once per distinct reason; short turns (< 40 tokens) carry
-            # no chunk vectors by LCM-X design, so "chunk vectors are
-            # unavailable" is expected on short-message stores.
-            _WARNED.add(reason)
-            print(f"[lcmx] degraded recall ({user_id}): {reason}", file=sys.stderr)
-
         sessions = self._load_sessions(user_id)
         lines = []
         for hit in payload.get("hits", [])[:top_k]:

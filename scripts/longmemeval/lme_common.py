@@ -9,7 +9,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+
+from utils.checkpoint import atomic_json_dump
+
+
+def write_question_id_map(rows, frame: str, version: str) -> None:
+    """Join search, answer and judge files by their stable user_id keys."""
+    mapping = {user_id_for(version, idx): row["question_id"] for idx, row in enumerate(rows)}
+    ids = list(mapping.values())
+    if any(not isinstance(qid, str) or not qid for qid in ids) or len(set(ids)) != len(ids):
+        raise ValueError("LME requires nonempty, unique original question_id values")
+    path = Path("results/lme") / f"{frame}-{version}" / f"{frame}_lme_question_ids.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_dump(mapping, path, indent=2)
 
 
 STATUS_SUCCESS = "success"
@@ -118,6 +132,8 @@ def build_search_entry(
         "search_duration_ms": duration_ms,
         "status": status,
     }
+    if "question_id" in row:
+        entry["question_id"] = row["question_id"]
     if reflect_answer is not None:
         entry["reflect_answer"] = reflect_answer
     if error is not None:

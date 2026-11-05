@@ -26,6 +26,7 @@ from longmemeval.lme_common import (
     status_counts,
     user_id_for,
     validate_single_search_result,
+    write_question_id_map,
 )
 
 def process_user(
@@ -168,6 +169,7 @@ def main(
     print("=" * 80)
 
     lme_df = load_lme_dataframe()
+    write_question_id_map(lme_df.to_dict("records"), frame, version)
     num_multi_sessions = len(lme_df)
     print(f"👥 Number of users: {num_multi_sessions}")
     print(f"⚙️  Search parameters: top_k={top_k}, workers={num_workers}")
