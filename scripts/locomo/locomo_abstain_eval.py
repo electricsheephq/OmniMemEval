@@ -59,7 +59,7 @@ def harness_sha() -> str:
         return "unknown"
 
 
-# v2 (CANDIDATE, not pinned by any bar until the release manager adopts its sha): v1 scored two answers that give the
+# v2 (RETIRED by Amendment 1; was a candidate, never pinned): v1 scored two answers that give the
 # answer while noting a missing detail ("...no specific city was given"; "...then she read it in 2022") as abstaining.
 ABSTAIN_JUDGE_PROMPT_V2 = """A memory assistant answered a question about past conversations.
 
@@ -78,7 +78,29 @@ Decide two things.
    meaning; false otherwise (false whenever the reference is "(none)").
 
 Reply with exactly: {{"abstains": true|false, "asserts_reference": true|false}}"""
-PROMPTS = {"v1": ABSTAIN_JUDGE_PROMPT, "v2": ABSTAIN_JUDGE_PROMPT_V2}
+# v3 (lever-3 bars Amendment 1, sha256 df21283b...): v1 with the definitions replaced by Amendment 1 rule 1. Nothing
+# else changes (system prompt, schema, model settings, frozen mapping). v2 is RETIRED (kept only for the record).
+ABSTAIN_JUDGE_PROMPT_V3 = """A memory assistant answered a question about past conversations.
+
+Question: {question}
+Assistant answer: {answer}
+Reference wrong answer (may be "(none)"): {adversarial_answer}
+
+Decide two things.
+1. "abstains": true when the answer gives no answer for the person or thing the question names. It may say that the
+   information is not in memory or not specified. It may also correct the question's premise by attributing the fact
+   to a different, named person; naming that other person's fact, attributed to them, is still abstaining.
+   "abstains" is false when the answer gives any answer content for the person or thing the question names: a plain
+   answer; a hedged one ("probably X"); one mixed with an abstention phrase ("not specified, but likely X"); a partial
+   one with a note that a detail is missing ("X, though no city was given"); or another person's fact presented as
+   the named person's, or given with no person named.
+2. "asserts_reference": true only when the answer asserts the reference wrong answer (or something with the same
+   meaning) as the answer for the person or thing the question names. Naming another person's fact, attributed to
+   that other person, is not asserting the reference, even when the reference's words appear. Always false when the
+   reference is "(none)".
+
+Reply with exactly: {{"abstains": true|false, "asserts_reference": true|false}}"""
+PROMPTS = {"v1": ABSTAIN_JUDGE_PROMPT, "v2": ABSTAIN_JUDGE_PROMPT_V2, "v3": ABSTAIN_JUDGE_PROMPT_V3}
 PROMPT_VERSION = os.getenv("LOCOMO_ABSTAIN_PROMPT_VERSION", "v1")
 
 
