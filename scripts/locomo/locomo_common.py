@@ -7,6 +7,7 @@ do not alter retrieval, answer generation, or grading logic.
 
 from __future__ import annotations
 
+import os
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any
@@ -26,7 +27,21 @@ def group_id_for(group_idx: int) -> str:
     return f"locomo_exp_user_{group_idx}"
 
 
+def locomo_qa_mode() -> str:
+    """LOCOMO_QA_MODE: unset/"default" = categories 1-4 (category 5 excluded, as before);
+    "cat5" = only category 5 (adversarial, scored by locomo_abstain_eval.py); "all" = every category."""
+    mode = (os.getenv("LOCOMO_QA_MODE") or "default").strip().lower()
+    if mode not in ("default", "cat5", "all"):
+        raise ValueError(f"LOCOMO_QA_MODE must be default, cat5 or all, not {mode!r}")
+    return mode
+
+
 def is_eval_qa(qa: dict[str, Any]) -> bool:
+    mode = locomo_qa_mode()
+    if mode == "cat5":
+        return qa.get("category") == 5
+    if mode == "all":
+        return True
     return qa.get("category") != 5
 
 

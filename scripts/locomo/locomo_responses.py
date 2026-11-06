@@ -114,6 +114,8 @@ async def process_qa(frame, qa, search_result, oai_client, model_name, semaphore
             "search_duration_ms": search_result.get("duration_ms", 0),
             "status": STATUS_SUCCESS,
         }
+        if qa_category == 5 and qa.get("adversarial_answer") is not None:
+            response_record["adversarial_answer"] = qa.get("adversarial_answer")
         if save_model_input:
             response_record["model_input"] = model_input
         return response_record
@@ -150,7 +152,7 @@ async def main(
     oai_client, answer_model = create_async_openai_client("ANSWER")
     print(f"[ANSWER] model={answer_model}")
 
-    locomo_df = pd.read_json("data/locomo/locomo10.json")
+    locomo_df = pd.read_json(os.getenv("LOCOMO_DATA_PATH") or "data/locomo/locomo10.json")
     with open(search_path) as file:
         locomo_search_results = json.load(file)
 

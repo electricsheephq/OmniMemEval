@@ -500,7 +500,7 @@ def main(
     skip_failed_search=False,
 ):
     load_env()
-    locomo_df = pd.read_json("data/locomo/locomo10.json")
+    locomo_df = pd.read_json(os.getenv("LOCOMO_DATA_PATH") or "data/locomo/locomo10.json")
     num_users = len(locomo_df)
     os.makedirs(f"results/locomo/{frame}-{version}/", exist_ok=True)
     all_search_results = defaultdict(list)

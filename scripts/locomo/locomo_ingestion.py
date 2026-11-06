@@ -312,7 +312,7 @@ def process_user(conv_idx, frame, locomo_df, version, success_records, f, clear=
 
 def main(frame, version="default", num_workers=2, clear=False):
     load_env()
-    locomo_df = pd.read_json("data/locomo/locomo10.json")
+    locomo_df = pd.read_json(os.getenv("LOCOMO_DATA_PATH") or "data/locomo/locomo10.json")
     num_users = len(locomo_df)
     start_time = time.time()
     total_time = 0
