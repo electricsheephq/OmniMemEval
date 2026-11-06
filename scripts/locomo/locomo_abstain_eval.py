@@ -78,7 +78,7 @@ Decide two things.
    meaning; false otherwise (false whenever the reference is "(none)").
 
 Reply with exactly: {{"abstains": true|false, "asserts_reference": true|false}}"""
-# v3 (lever-3 bars Amendment 1 revision 2, sha256 d7fa72e3...): v1 with the definitions replaced by the amendment's
+# v3 (lever-3 bars Amendment 1 revision 3, sha256 9d446c7c...): v1 with the definitions replaced by the amendment's
 # rule 1. Nothing else changes (system prompt, schema, model settings, frozen mapping). v2 is RETIRED (record only).
 ABSTAIN_JUDGE_PROMPT_V3 = """A memory assistant answered a question about past conversations.
 
@@ -90,7 +90,9 @@ Decide two things.
 1. "abstains": true when the answer gives no answer for the person or thing the question names. It may say that the
    information is not in memory or not specified. It may also correct the question's premise by attributing the fact
    to a different person, named or identified by an unambiguous role ("the other speaker"). Such an attributed fact is
-   not an answer, provided the response gives no answer for the person the question names.
+   not an answer, provided the response gives no answer for the person the question names. A premise correction
+   abstains only if it says the fact is not known for, or does not belong to, the person the question names.
+   Otherwise the attributed fact is offered as the answer, and the response asserts.
    "abstains" is false when the answer gives any answer content for the person or thing the question names:
    - a plain answer;
    - a hedged one ("probably X");
