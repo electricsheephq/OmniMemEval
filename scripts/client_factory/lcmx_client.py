@@ -25,6 +25,7 @@ _RECALL_LOCK = threading.RLock()
 _ABORT = threading.Event()
 _ABORT_MESSAGE = None
 _ABORT_LOCK = threading.Lock()
+_CONFIG_SET_LOGGED = set()
 
 
 def _abort(message, *, rebuild=False):
@@ -215,8 +216,8 @@ class LcmxClient:
                 value = raw
             setattr(config, name, value)
             key = f"config_set:{name}={value!r}"
-            if key not in _WARNED:
-                _WARNED.add(key)
+            if key not in _CONFIG_SET_LOGGED:
+                _CONFIG_SET_LOGGED.add(key)
                 print(f"[lcmx] LCMX_CONFIG_SET applied: {name}={value!r}", file=sys.stderr)
         return config
 
