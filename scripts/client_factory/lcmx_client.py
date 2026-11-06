@@ -186,14 +186,33 @@ class LcmxClient:
         from hermes_lcm.config import LCMConfig
 
         if not self._embeddings:
-            return LCMConfig(database_path=str(self._db_path(user_id)),
-                             embeddings_enabled=False)
-        return LCMConfig(
-            database_path=str(self._db_path(user_id)),
-            embeddings_enabled=True,
-            embedding_provider=self._provider_name,
-            embedding_model=self._model,
-        )
+            config = LCMConfig(database_path=str(self._db_path(user_id)),
+                               embeddings_enabled=False)
+        else:
+            config = LCMConfig(
+                database_path=str(self._db_path(user_id)),
+                embeddings_enabled=True,
+                embedding_provider=self._provider_name,
+                embedding_model=self._model,
+            )
+        # R2 flag arms: LCMX_CONFIG_SET="field=value,field=value" sets LCM-X config fields
+        # (bool/int/float/str coerced from the field's default). Unknown fields abort.
+        for item in filter(None, (env_str("LCMX_CONFIG_SET", "") or "").split(",")):
+            name, _, raw = item.partition("=")
+            name, raw = name.strip(), raw.strip()
+            if not hasattr(config, name):
+                raise ValueError(f"LCMX_CONFIG_SET: unknown LCM-X config field {name!r}")
+            default = getattr(config, name)
+            if isinstance(default, bool):
+                value = raw.lower() in ("1", "true", "yes", "on")
+            elif isinstance(default, int):
+                value = int(raw)
+            elif isinstance(default, float):
+                value = float(raw)
+            else:
+                value = raw
+            setattr(config, name, value)
+        return config
 
     def _open(self, user_id):
         from hermes_lcm.dag import SummaryDAG
