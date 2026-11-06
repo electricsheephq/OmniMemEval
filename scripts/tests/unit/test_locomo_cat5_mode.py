@@ -49,13 +49,13 @@ def test_parse_label_strict():
 
 def test_summary_counts():
     items = {
-        "a": {"category": 5, "status": "success", "abstains": True, "asserts_reference": False},
-        "b": {"category": 5, "status": "success", "abstains": False, "asserts_reference": True},
-        "c": {"category": 2, "status": "success", "abstains": True, "asserts_reference": False},
+        "a": {"category": 5, "status": "success", "abstains": True, "asserts_reference": False, "pass": True},
+        "b": {"category": 5, "status": "success", "abstains": False, "asserts_reference": True, "pass": False},
+        "c": {"category": 2, "status": "success", "abstains": True, "asserts_reference": False, "pass": True},
         "d": {"category": 5, "status": "failed"},
     }
     s = ae.summarize(items)
-    assert (s["cat5_n"], s["cat5_pass_abstain"], s["cat5_asserts_adversarial"]) == (2, 1, 1)
+    assert (s["cat5_n"], s["cat5_pass"], s["cat5_asserts_adversarial"]) == (2, 1, 1)
     assert (s["cat1_4_n"], s["cat1_4_scored_abstain"], s["failed"]) == (1, 1, 1)
 
 
@@ -76,3 +76,10 @@ def test_judge_one_sends_reference_or_none():
     asyncio.run(ae.judge_one(C, "m", {"question": "q", "answer": "a"}, sem))
     assert "Reference wrong answer (may be \"(none)\"): wrong" in sent[0]
     assert "Reference wrong answer (may be \"(none)\"): (none)" in sent[1]
+
+
+def test_verdict_mapping_frozen():
+    assert ae.verdict_pass({"abstains": True, "asserts_reference": False}) is True
+    assert ae.verdict_pass({"abstains": True, "asserts_reference": True}) is False
+    assert ae.verdict_pass({"abstains": False, "asserts_reference": False}) is False
+    assert ae.verdict_pass({"abstains": False, "asserts_reference": True}) is False
