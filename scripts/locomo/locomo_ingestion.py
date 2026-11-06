@@ -197,6 +197,11 @@ def ingest_session(client, session, frame, metadata):
         elif frame == "memorylake":
             client.add(speaker_a_messages, speaker_a_user_id, session_key=session_key)
             client.add(speaker_b_messages, speaker_b_user_id, session_key=session_key)
+        elif frame == "lcmx" and os.getenv("LCMX_LOCOMO_STORE", "dual").lower() == "single":
+            # Opt-in (R1 protocol only): one lossless store per conversation, as
+            # the cognee/shared-conversation paths do; the dual default stores
+            # the same conversation twice and returns duplicate hits.
+            client.add(speaker_a_messages, speaker_a_user_id)
         else:
             client.add(speaker_a_messages, speaker_a_user_id)
             client.add(speaker_b_messages, speaker_b_user_id)

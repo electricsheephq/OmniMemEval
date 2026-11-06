@@ -104,6 +104,31 @@ def shared_conv_search(
     return context, duration_ms, None, mem_text
 
 
+def lcmx_search(
+    client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b
+):
+    """LCM-X: the default dual-speaker path, or (LCMX_LOCOMO_STORE=single, R1
+    protocol only) one store per conversation whose 2*top_k distinct hits fill
+    the two speaker slots in rank order, instead of the same top_k twice."""
+    if os.getenv("LCMX_LOCOMO_STORE", "dual").lower() != "single":
+        return generic_text_search(
+            client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b
+        )
+    from utils.prompts import DUAL_SPEAKER_TEMPLATE
+
+    start = time()
+    lines = _memory_text(client.search(query, speaker_a_user_id, 2 * top_k)).splitlines()
+    mem_a, mem_b = "\n".join(lines[:top_k]), "\n".join(lines[top_k:])
+    context = DUAL_SPEAKER_TEMPLATE.format(
+        speaker_1=speaker_a,
+        speaker_1_memories=mem_a,
+        speaker_2=speaker_b,
+        speaker_2_memories=mem_b,
+    )
+    duration_ms = (time() - start) * 1000
+    return context, duration_ms, None, _combined_raw_context(mem_a, mem_b)
+
+
 def cognee_search(
     client, query, speaker_a_user_id, speaker_b_user_id, top_k, speaker_a, speaker_b
 ):
@@ -267,7 +292,7 @@ def search_query(client, query, metadata, frame, top_k=20):
         "memorylake": generic_text_search,
         "backboard": backboard_search,
         "mem9": generic_text_search,
-        "lcmx": generic_text_search,
+        "lcmx": lcmx_search,
     }
     search_fn = _search_dispatch.get(frame)
     if search_fn is None:
