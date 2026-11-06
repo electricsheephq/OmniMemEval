@@ -83,3 +83,46 @@ def test_verdict_mapping_frozen():
     assert ae.verdict_pass({"abstains": True, "asserts_reference": True}) is False
     assert ae.verdict_pass({"abstains": False, "asserts_reference": False}) is False
     assert ae.verdict_pass({"abstains": False, "asserts_reference": True}) is False
+
+
+def _capture_client(sent):
+    class C:
+        class chat:
+            class completions:
+                @staticmethod
+                async def create(**kw):
+                    sent.append(kw)
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                        content=json.dumps({"abstains": True, "asserts_reference": False})))])
+    return C
+
+
+def test_max_tokens_sent_by_default_and_omitted_when_none(monkeypatch):
+    sent = []
+    sem = asyncio.Semaphore(1)
+    asyncio.run(ae.judge_one(_capture_client(sent), "m", {"question": "q", "answer": "a"}, sem))
+    assert sent[-1]["max_tokens"] == 256 and sent[-1]["temperature"] == 0
+    monkeypatch.setattr(ae, "JUDGE_MAX_TOKENS", None)
+    asyncio.run(ae.judge_one(_capture_client(sent), "m", {"question": "q", "answer": "a"}, sem))
+    assert "max_tokens" not in sent[-1] and sent[-1]["temperature"] == 0
+    assert ae.instrument("m", "s")["max_tokens"] is None
+
+
+def test_section4_env_is_read_at_import(monkeypatch):
+    import importlib
+    monkeypatch.setenv("LOCOMO_ABSTAIN_MAX_TOKENS", "none")
+    monkeypatch.setenv("LOCOMO_ABSTAIN_TAG", "sol-low")
+    monkeypatch.setenv("LOCOMO_ABSTAIN_SETTINGS_NOTE", "temperature sent, not applied")
+    m = importlib.reload(ae)
+    try:
+        assert m.JUDGE_MAX_TOKENS is None and m.OUT_TAG == "sol-low"
+        inst = m.instrument("sol-low", "s")
+        assert inst["output_tag"] == "sol-low" and inst["settings_note"] == "temperature sent, not applied"
+        monkeypatch.setenv("LOCOMO_ABSTAIN_TAG", "../x")
+        with pytest.raises(SystemExit):
+            importlib.reload(ae)
+    finally:
+        for k in ("LOCOMO_ABSTAIN_MAX_TOKENS", "LOCOMO_ABSTAIN_TAG", "LOCOMO_ABSTAIN_SETTINGS_NOTE"):
+            monkeypatch.delenv(k, raising=False)
+        importlib.reload(ae)
+    assert ae.JUDGE_MAX_TOKENS == 256 and ae.OUT_TAG == ""

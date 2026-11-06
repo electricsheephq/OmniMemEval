@@ -43,6 +43,15 @@ Reply with exactly: {{"abstains": true|false, "asserts_reference": true|false}}"
 
 JUDGE_TEMPERATURE = 0
 JUDGE_MAX_TOKENS = 256
+# Amendment 1 section 4 (judge model fallback): an OpenAI-compatible endpoint that rejects max_tokens (the frontier shim)
+# runs with LOCOMO_ABSTAIN_MAX_TOKENS=none, which omits the field; the instrument block records max_tokens=null.
+# LOCOMO_ABSTAIN_TAG suffixes the judged-output file so a second judge model never resumes from another's items.
+# LOCOMO_ABSTAIN_SETTINGS_NOTE is copied verbatim into the instrument block (for example "temperature sent, not applied").
+if (os.getenv("LOCOMO_ABSTAIN_MAX_TOKENS") or "").strip().lower() == "none":
+    JUDGE_MAX_TOKENS = None
+OUT_TAG = (os.getenv("LOCOMO_ABSTAIN_TAG") or "").strip()
+if OUT_TAG and not OUT_TAG.replace("-", "").replace("_", "").isalnum():
+    raise SystemExit("LOCOMO_ABSTAIN_TAG must be alphanumeric with - or _")
 
 
 def verdict_pass(label: dict) -> bool:
@@ -140,7 +149,8 @@ async def judge_one(client, model, rec, semaphore):
                                          adversarial_answer="(none)" if adv in (None, "") else adv)
     async with semaphore:
         resp = await client.chat.completions.create(
-            model=model, temperature=JUDGE_TEMPERATURE, max_tokens=JUDGE_MAX_TOKENS,
+            model=model, temperature=JUDGE_TEMPERATURE,
+            **({} if JUDGE_MAX_TOKENS is None else {"max_tokens": JUDGE_MAX_TOKENS}),
             messages=[{"role": "system", "content": ABSTAIN_JUDGE_SYSTEM}, {"role": "user", "content": prompt}])
     label = parse_label(resp.choices[0].message.content or "")
     return {**label, "pass": verdict_pass(label)}
@@ -164,6 +174,7 @@ def instrument(model, sha):
     return {"judge_model": model, "judge_base_url": os.getenv("EVAL_BASE_URL"),
             "judge_extra_body": os.getenv("EVAL_EXTRA_BODY"), "temperature": JUDGE_TEMPERATURE,
             "max_tokens": JUDGE_MAX_TOKENS, "prompt_version": PROMPT_VERSION, "prompt_sha256": sha, "harness_sha": harness_sha(),
+            "output_tag": OUT_TAG or None, "settings_note": os.getenv("LOCOMO_ABSTAIN_SETTINGS_NOTE") or None,
             "mapping": "PASS iff abstains is true and asserts_reference is false"}
 
 
@@ -213,7 +224,7 @@ async def main_async(lib, version, llm_workers, expect_sha):
     print(f"[EVAL] model={model}")
     rdir = f"results/locomo/{lib}-{version}"
     responses = json.load(open(f"{rdir}/{lib}_locomo_responses.json"))
-    out_path = f"{rdir}/{lib}_locomo_abstain_judged{'' if PROMPT_VERSION == 'v1' else '_' + PROMPT_VERSION}.json"
+    out_path = f"{rdir}/{lib}_locomo_abstain_judged{'' if PROMPT_VERSION == 'v1' else '_' + PROMPT_VERSION}{'_' + OUT_TAG if OUT_TAG else ''}.json"
     prior = json.load(open(out_path)).get("items", {}) if os.path.exists(out_path) else {}
     items, todo = {}, []
     for group_id, recs in responses.items():
