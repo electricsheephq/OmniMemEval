@@ -474,6 +474,37 @@ class LcmxClient:
 
     # -- search ---------------------------------------------------------------
 
+    def _log_recall_call(self, user_id, query, config, payload):
+        """Opt-in per-call arm proof (LCMX_RECALL_CALL_LOG=1): one JSONL line per lcm_recall call, next to the
+        stage's lcmx_recall_status.json, with the arm label (LCMX_ARM), the resolved value of every config field
+        named in LCMX_CONFIG_SET or LCMX_LOG_CONFIG_FIELDS ("<absent>" when the tree has no such field), the
+        provenance policy markers, and the hit store ids. No query or hit text is logged."""
+        if (env_str("LCMX_RECALL_CALL_LOG", "") or "") not in ("1", "true", "yes"):
+            return
+        import hashlib
+
+        fields = [item.partition("=")[0].strip()
+                  for item in (env_str("LCMX_CONFIG_SET", "") or "").split(",") if item.strip()]
+        fields += [f.strip() for f in (env_str("LCMX_LOG_CONFIG_FIELDS", "") or "").split(",") if f.strip()]
+        prov = payload.get("provenance") or {}
+        line = {
+            "user_id": user_id,
+            "query_sha256": hashlib.sha256(str(query).encode("utf-8")).hexdigest(),
+            "arm": env_str("LCMX_ARM", "") or "",
+            "config": {f: getattr(config, f, "<absent>") for f in dict.fromkeys(fields)},
+            "forget_withheld": [r.get("store_id") if isinstance(r, dict) else r
+                                for r in prov.get("forget_withheld") or []],
+            "forget_withheld_receipts": prov.get("forget_withheld") or [],
+            "forget_unavailable": prov.get("forget_unavailable"),
+            "delivery_order": prov.get("delivery_order"),
+            "hit_store_ids": [h.get("store_id") for h in payload.get("hits", [])],
+            "degraded": bool(payload.get("degraded")),
+        }
+        path = getattr(self, "_search_status_path", self._db_root / "search_status.json").parent / "lcmx_recall_calls.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _RECALL_LOCK, open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, default=str) + "\n")
+
     def search(self, query, user_id, top_k):
         """Run ``lcm_recall`` and return one ``[event_time] text`` line per hit."""
         _check_abort()
@@ -505,6 +536,7 @@ class LcmxClient:
                 _check_abort()
                 payload = json.loads(lcm_tools.lcm_recall(args, engine=engine))
                 self._record_search_payload(user_id, payload)
+                self._log_recall_call(user_id, query, config, payload)
             # Recall snippets are cut at 300 chars; deliver the full stored
             # message for message hits (LCMX_DELIVERY=snippet restores the cut).
             full_rows = {}
