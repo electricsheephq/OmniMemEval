@@ -204,6 +204,8 @@ class LcmxClient:
                 raise ValueError(f"LCMX_CONFIG_SET: unknown LCM-X config field {name!r}")
             default = getattr(config, name)
             if isinstance(default, bool):
+                if raw.lower() not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+                    raise ValueError(f"LCMX_CONFIG_SET: {name} needs a boolean, got {raw!r}")
                 value = raw.lower() in ("1", "true", "yes", "on")
             elif isinstance(default, int):
                 value = int(raw)
@@ -212,6 +214,10 @@ class LcmxClient:
             else:
                 value = raw
             setattr(config, name, value)
+            key = f"config_set:{name}={value!r}"
+            if key not in _WARNED:
+                _WARNED.add(key)
+                print(f"[lcmx] LCMX_CONFIG_SET applied: {name}={value!r}", file=sys.stderr)
         return config
 
     def _open(self, user_id):
