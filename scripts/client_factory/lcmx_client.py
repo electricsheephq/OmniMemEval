@@ -487,7 +487,10 @@ class LcmxClient:
                   for item in (env_str("LCMX_CONFIG_SET", "") or "").split(",") if item.strip()]
         fields += [f.strip() for f in (env_str("LCMX_LOG_CONFIG_FIELDS", "") or "").split(",") if f.strip()]
         prov = payload.get("provenance") or {}
+        from datetime import datetime, timezone
+
         line = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
             "user_id": user_id,
             "query_sha256": hashlib.sha256(str(query).encode("utf-8")).hexdigest(),
             "arm": env_str("LCMX_ARM", "") or "",
