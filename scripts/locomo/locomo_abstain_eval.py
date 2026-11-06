@@ -59,8 +59,32 @@ def harness_sha() -> str:
         return "unknown"
 
 
-def prompt_sha256() -> str:
-    return hashlib.sha256((ABSTAIN_JUDGE_SYSTEM + "\n\x00\n" + ABSTAIN_JUDGE_PROMPT).encode("utf-8")).hexdigest()
+# v2 (CANDIDATE, not pinned by any bar until the release manager adopts its sha): v1 scored two answers that give the
+# answer while noting a missing detail ("...no specific city was given"; "...then she read it in 2022") as abstaining.
+ABSTAIN_JUDGE_PROMPT_V2 = """A memory assistant answered a question about past conversations.
+
+Question: {question}
+Assistant answer: {answer}
+Reference wrong answer (may be "(none)"): {adversarial_answer}
+
+Decide two things.
+1. "abstains": true only if the answer gives NO answer to the question: it says the information is not available,
+   not in memory, not mentioned, unknown, or cannot be determined, and states nothing that answers the question.
+   An answer that only says the premise is wrong, without asserting an alternative, is true.
+   It is false whenever the answer states any specific content that answers the question (a date, time, place, name,
+   item, reason, description), even if it is hedged ("probably", "I think", "if X then"), even if it also says some
+   detail is missing or unspecified, and even if it is combined with an abstention phrase.
+2. "asserts_reference": true only if the answer asserts the reference wrong answer or something with the same
+   meaning; false otherwise (false whenever the reference is "(none)").
+
+Reply with exactly: {{"abstains": true|false, "asserts_reference": true|false}}"""
+PROMPTS = {"v1": ABSTAIN_JUDGE_PROMPT, "v2": ABSTAIN_JUDGE_PROMPT_V2}
+PROMPT_VERSION = os.getenv("LOCOMO_ABSTAIN_PROMPT_VERSION", "v1")
+
+
+def prompt_sha256(version=None) -> str:
+    text = PROMPTS[version or PROMPT_VERSION]
+    return hashlib.sha256((ABSTAIN_JUDGE_SYSTEM + "\n\x00\n" + text).encode("utf-8")).hexdigest()
 
 
 def parse_label(text: str) -> dict:
@@ -83,7 +107,7 @@ def item_key(group_id: str, idx: int, question: str) -> str:
 
 async def judge_one(client, model, rec, semaphore):
     adv = rec.get("adversarial_answer")
-    prompt = ABSTAIN_JUDGE_PROMPT.format(question=rec.get("question") or "", answer=rec.get("answer") or "",
+    prompt = PROMPTS[PROMPT_VERSION].format(question=rec.get("question") or "", answer=rec.get("answer") or "",
                                          adversarial_answer="(none)" if adv in (None, "") else adv)
     async with semaphore:
         resp = await client.chat.completions.create(
@@ -110,7 +134,7 @@ def summarize(items: dict) -> dict:
 def instrument(model, sha):
     return {"judge_model": model, "judge_base_url": os.getenv("EVAL_BASE_URL"),
             "judge_extra_body": os.getenv("EVAL_EXTRA_BODY"), "temperature": JUDGE_TEMPERATURE,
-            "max_tokens": JUDGE_MAX_TOKENS, "prompt_sha256": sha, "harness_sha": harness_sha(),
+            "max_tokens": JUDGE_MAX_TOKENS, "prompt_version": PROMPT_VERSION, "prompt_sha256": sha, "harness_sha": harness_sha(),
             "mapping": "PASS iff abstains is true and asserts_reference is false"}
 
 
@@ -160,7 +184,7 @@ async def main_async(lib, version, llm_workers, expect_sha):
     print(f"[EVAL] model={model}")
     rdir = f"results/locomo/{lib}-{version}"
     responses = json.load(open(f"{rdir}/{lib}_locomo_responses.json"))
-    out_path = f"{rdir}/{lib}_locomo_abstain_judged.json"
+    out_path = f"{rdir}/{lib}_locomo_abstain_judged{'' if PROMPT_VERSION == 'v1' else '_' + PROMPT_VERSION}.json"
     prior = json.load(open(out_path)).get("items", {}) if os.path.exists(out_path) else {}
     items, todo = {}, []
     for group_id, recs in responses.items():
