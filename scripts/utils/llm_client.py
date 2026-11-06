@@ -235,6 +235,34 @@ def _record_llm_usage(
         return
 
 
+def _extra_body_for(module: str) -> dict[str, Any] | None:
+    """Optional ``{MODULE}_EXTRA_BODY`` JSON object merged into every request body.
+
+    Example: ``EVAL_EXTRA_BODY='{"thinking": {"type": "disabled"}}'`` turns GLM's
+    default thinking off at z.ai's OpenAI-compatible endpoint. Unset keeps the
+    request byte-identical to the upstream harness.
+    """
+    raw = os.getenv(f"{module}_EXTRA_BODY")
+    if not raw or not raw.strip():
+        return None
+    import json
+
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError(f"{module}_EXTRA_BODY must be a JSON object")
+    return value
+
+
+def _with_extra_body(module: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    extra = _extra_body_for(module)
+    if extra is None:
+        return kwargs
+    merged = dict(kwargs.get("extra_body") or {})
+    for key, val in extra.items():
+        merged.setdefault(key, val)
+    return {**kwargs, "extra_body": merged}
+
+
 def _call_with_retries(fn: Callable[[], _T], config: LLMRetryConfig) -> _T:
     for attempt in range(config.max_retries + 1):
         try:
@@ -283,6 +311,7 @@ class _TrackedSyncCompletions:
         self._retry_config = retry_config
 
     def create(self, *args, **kwargs):
+        kwargs = _with_extra_body(self._retry_config.module, kwargs)
         resp = _call_with_retries(
             lambda: self._completions.create(*args, **kwargs),
             self._retry_config,
@@ -319,6 +348,7 @@ class _TrackedAsyncCompletions:
         self._retry_config = retry_config
 
     async def create(self, *args, **kwargs):
+        kwargs = _with_extra_body(self._retry_config.module, kwargs)
         resp = await _acall_with_retries(
             lambda: self._completions.create(*args, **kwargs),
             self._retry_config,
