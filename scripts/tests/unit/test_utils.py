@@ -269,5 +269,42 @@ class TestExtractLabelJson(unittest.TestCase):
         self.assertIsNone(result)
 
 
+@unittest.skipUnless(_extract_label_json.__module__ == "utils.nlp_metrics", "needs utils.nlp_metrics (heavy deps)")
+class TestExtractLabelJsonExtraKeys(unittest.TestCase):
+    """GLM-5.3 sometimes adds a reasoning key; R1 2026-11-07 saw 4 in 1540 LoCoMo judge calls, each blocking its group."""
+
+    REAL = [  # the four real replies (reasoning shortened), with the label each must yield
+        ('{"label": "WRONG", "reasoning": "While peach cobbler matches, the answer explicitly denies it."}', "WRONG"),
+        ('{"label": "CORRECT", "reasoning": "The generated answer includes camping, which matches."}', "CORRECT"),
+        ('{"label": "WRONG", "reasoning": "The gold answer lists two career-highs (highest point score)."}', "WRONG"),
+        ('{"label": "CORRECT", "reasoning": "The generated answer touches on the same topic \u2014 vegan ice cream."}',
+         "CORRECT"),
+    ]
+
+    def test_real_replies_with_reasoning_key(self):
+        import json as _json
+        for text, want in self.REAL:
+            out = _extract_label_json(text)
+            self.assertIsNotNone(out, text)
+            self.assertEqual(_json.loads(out)["label"], want)
+
+    def test_strict_shapes_unchanged(self):
+        for text in ('{"label": "CORRECT"}', '{"label":"WRONG"}', "Verdict: {\"label\": 'correct'} done",
+                     'x {"label": "incorrect"} y', '```json\n{"label": "WRONG"}\n```'):
+            import re as _re
+            strict = _re.search(r'\{\s*"label"\s*:\s*["\']([^"\']*)["\']\s*\}', text).group(0)
+            self.assertEqual(_extract_label_json(text), strict)
+
+    def test_fallback_rejects_other_labels_and_truncation(self):
+        self.assertIsNone(_extract_label_json('{"label": "MAYBE", "reasoning": "x"}'))
+        self.assertIsNone(_extract_label_json('{"label": "WRONG", "reasoning": "cut off'))
+        self.assertIsNone(_extract_label_json('{"verdict": "CORRECT", "reasoning": "x"}'))
+        self.assertIsNone(_extract_label_json('{"label": 1, "reasoning": "x"}'))
+
+    def test_fallback_takes_first_valid_object(self):
+        import json as _json
+        out = _extract_label_json('note {"a": 1} then {"label": "Correct", "reasoning": "ok"} {"label": "WRONG", "r": 1}')
+        self.assertEqual(_json.loads(out)["label"], "Correct")
+
 if __name__ == "__main__":
     unittest.main()

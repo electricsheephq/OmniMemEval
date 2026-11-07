@@ -63,12 +63,29 @@ class LLMGrade(BaseModel):
 # ── Label extraction ──────────────────────────────────────────────────────────
 
 
+_GRADER_LABELS = {"correct", "wrong"}
+
+
 def extract_label_json(text: str) -> str | None:
-    """Extract ``{"label": "VALUE"}`` from LLM grader output."""
+    """Extract ``{"label": "VALUE"}`` from LLM grader output.
+
+    The strict form ``{"label": "VALUE"}`` is matched first, exactly as before, so every reply that parsed before
+    returns the same string. Only when it finds nothing: the first complete JSON object in the text that has a string
+    ``label`` of CORRECT or WRONG (any case) is accepted, e.g. ``{"label": "WRONG", "reasoning": "..."}``, which GLM-5.3
+    sometimes returns; it is returned normalised as ``{"label": "<value>"}``. Truncated or other JSON still gives None.
+    """
     pattern = r'\{\s*"label"\s*:\s*["\']([^"\']*)["\']\s*\}'
     match = re.search(pattern, text)
     if match:
         return match.group(0)
+    decoder = json.JSONDecoder()
+    for start in (m.start() for m in re.finditer(r"\{", text)):
+        try:
+            obj, _ = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("label"), str) and obj["label"].strip().lower() in _GRADER_LABELS:
+            return json.dumps({"label": obj["label"]})
     return None
 
 
