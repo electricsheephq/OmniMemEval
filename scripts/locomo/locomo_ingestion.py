@@ -21,7 +21,29 @@ from utils.ingest_helpers import inject_time, AddCallTimer
 from client_factory import SUPPORTED_LIBS, DEFAULT_LIB
 
 
+IMAGE_CAPTION_ENV = "LOCOMO_IMAGE_CAPTIONS"
+
+
+def apply_image_captions(session):
+    """Opt-in (LOCOMO_IMAGE_CAPTIONS=1; default off, so ingestion is byte-identical to before): return a copy of the
+    session in which every turn with a dataset ``blip_caption`` has it appended to its text as
+    `` (description of attached image: <caption>)`` -- the wording the zep/graphiti paths already use -- and the
+    caption key removed, so every library ingests the same caption text once whatever its own message builder reads.
+    Without the switch the session object is returned unchanged."""
+    if (os.getenv(IMAGE_CAPTION_ENV, "") or "").strip().lower() not in ("1", "true", "yes", "on"):
+        return session
+    out = []
+    for chat in session:
+        caption = chat.get("blip_caption")
+        if caption:
+            chat = {k: v for k, v in chat.items() if k != "blip_caption"}
+            chat["text"] = f"{chat.get('text')} (description of attached image: {caption})"
+        out.append(chat)
+    return out
+
+
 def ingest_session(client, session, frame, metadata):
+    session = apply_image_captions(session)
     dt = parse_locomo_time(metadata["session_date"])
     iso_date = to_iso(dt)
     conv_idx = metadata["conv_idx"]
