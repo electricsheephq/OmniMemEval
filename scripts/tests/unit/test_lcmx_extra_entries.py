@@ -58,17 +58,23 @@ def _search(monkeypatch, tmp_path, hits, top_k=3):
     return c.search("q", "u", top_k), batches
 
 
-def test_off_by_default_base_bytes_and_extras_cut(monkeypatch, tmp_path):
+def test_off_by_default_base_bytes(monkeypatch, tmp_path):
     monkeypatch.delenv("LCMX_EXTRA_ENTRIES", raising=False)
+    text, batches = _search(monkeypatch, tmp_path, BASE_HITS)
+    assert text == BASE_TEXT and batches == [[1, 3]]
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "false"])
+def test_extras_without_the_flag_are_refused(monkeypatch, tmp_path, value):
+    # LoCoMo cuts at hits[:40], above the 25 delivered hits: unflagged extras would
+    # otherwise render as full stored rows.
+    if value is None:
+        monkeypatch.delenv("LCMX_EXTRA_ENTRIES", raising=False)
+    else:
+        monkeypatch.setenv("LCMX_EXTRA_ENTRIES", value)
     assert _search(monkeypatch, tmp_path, BASE_HITS)[0] == BASE_TEXT
-    # Flag off, a payload carrying extras renders exactly as today: cut at top_k.
-    assert _search(monkeypatch, tmp_path, BASE_HITS + EXTRAS)[0] == BASE_TEXT
-
-
-@pytest.mark.parametrize("value", ["", "0", "false"])
-def test_other_values_stay_off(monkeypatch, tmp_path, value):
-    monkeypatch.setenv("LCMX_EXTRA_ENTRIES", value)
-    assert _search(monkeypatch, tmp_path, BASE_HITS + EXTRAS)[0] == BASE_TEXT
+    with pytest.raises(RuntimeError, match="LCMX_EXTRA_ENTRIES.*recall_extra_entries"):
+        _search(monkeypatch, tmp_path, BASE_HITS + EXTRAS[:1], top_k=40)
 
 
 def test_on_without_extras_is_byte_identical(monkeypatch, tmp_path):

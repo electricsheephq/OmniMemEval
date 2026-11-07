@@ -549,6 +549,12 @@ class LcmxClient:
             if (env_str("LCMX_EXTRA_ENTRIES", "") or "") in ("1", "true", "yes"):
                 extras = [h for h in hits if h.get("extra") is True]
                 hits = [h for h in hits if h.get("extra") is not True]
+            elif any(h.get("extra") is True for h in hits):
+                raise RuntimeError(
+                    "lcm_recall returned extra entries (recall_extra_entries is on) but LCMX_EXTRA_ENTRIES is "
+                    "not set: set LCMX_EXTRA_ENTRIES=1 with LCMX_CONFIG_SET=recall_extra_entries=..., or turn "
+                    "recall_extra_entries off"
+                )
             # Recall snippets are cut at 300 chars; deliver the full stored
             # message for message hits (LCMX_DELIVERY=snippet restores the cut).
             full_rows = {}
