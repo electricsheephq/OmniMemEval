@@ -107,6 +107,9 @@ class LcmxClient:
         LCMX_DELIVERY        – "full" (default): full stored message per hit;
                                "snippet": lcm_recall's 300-char snippet
         LCMX_CATCHUP_MAX_PASSES – maintenance pass limit (default: 500)
+        LCMX_EXTRA_ENTRIES   – "1": render lcm_recall extra entries (extra=true,
+                               recall_extra_entries) after the top_k hits as
+                               their window text only; off by default
         FASTEMBED_CACHE_PATH / LCM_LONGMEMEVAL_FASTEMBED_CACHE – model cache
         TIKTOKEN_CACHE_DIR  – populated tokenizer cache (set by the job)
     """
@@ -540,11 +543,17 @@ class LcmxClient:
                 payload = json.loads(lcm_tools.lcm_recall(args, engine=engine))
                 self._record_search_payload(user_id, payload)
                 self._log_recall_call(user_id, query, config, payload)
+            # LCMX_EXTRA_ENTRIES=1 (lever 9): extra entries are rendered after the
+            # top_k hits from their window alone; off, the hit list is untouched.
+            hits, extras = payload.get("hits", []), []
+            if (env_str("LCMX_EXTRA_ENTRIES", "") or "") in ("1", "true", "yes"):
+                extras = [h for h in hits if h.get("extra") is True]
+                hits = [h for h in hits if h.get("extra") is not True]
             # Recall snippets are cut at 300 chars; deliver the full stored
             # message for message hits (LCMX_DELIVERY=snippet restores the cut).
             full_rows = {}
             if self._delivery == "full":
-                ids = [h.get("store_id") for h in payload.get("hits", [])
+                ids = [h.get("store_id") for h in hits
                        if isinstance(h.get("store_id"), int)]
                 full_rows = store.get_batch(ids)
         finally:
@@ -556,7 +565,7 @@ class LcmxClient:
             raise RuntimeError(f"lcm_recall error: {payload['error']}")
         sessions = self._load_sessions(user_id)
         lines = []
-        for hit in payload.get("hits", [])[:top_k]:
+        for hit in hits[:top_k]:
             row = full_rows.get(hit.get("store_id")) if hit.get("kind") != "summary" else None
             if row and row.get("content"):
                 text = " ".join(str(row["content"]).split())
@@ -564,6 +573,17 @@ class LcmxClient:
                 # Drop the FTS match-highlight markers; keep the stored text.
                 snippet = str(hit.get("snippet") or "").replace(">>>", "").replace("<<<", "")
                 text = " ".join(snippet.split())
+            if not text:
+                continue
+            event_time = hit.get("event_time") or (
+                sessions.get(str(hit.get("session_id"))) or {}
+            ).get("time")
+            prefix = f"[{event_time}] " if event_time else ""
+            if hit.get("kind") == "summary":
+                prefix += "(session summary) "
+            lines.append(prefix + text)
+        for hit in extras:  # bounded by lcm-x (at most N); not cut at top_k
+            text = " ".join(str(hit.get("window") or "").split())
             if not text:
                 continue
             event_time = hit.get("event_time") or (
