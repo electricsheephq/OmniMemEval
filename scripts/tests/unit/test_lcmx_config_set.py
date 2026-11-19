@@ -42,3 +42,12 @@ def test_unknown_field_and_bad_bool_raise(monkeypatch):
         _config(monkeypatch, "no_such_field=1")
     with pytest.raises(ValueError):
         _config(monkeypatch, "recall_honour_forget=ture")
+
+
+@pytest.mark.parametrize("version", [None, "2"])
+def test_applied_line_names_adapter_version(monkeypatch, capsys, version):
+    monkeypatch.setattr(lcmx_client, "_CONFIG_SET_LOGGED", set())
+    monkeypatch.delenv("LCMX_ADAPTER_VERSION", raising=False) if version is None else monkeypatch.setenv(
+        "LCMX_ADAPTER_VERSION", version)
+    _config(monkeypatch, "recall_limit=30")
+    assert capsys.readouterr().err == f"[lcmx] LCMX_CONFIG_SET applied: recall_limit=30 adapter_version={version or 1}\n"

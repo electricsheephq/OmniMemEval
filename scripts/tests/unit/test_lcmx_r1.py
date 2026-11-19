@@ -172,7 +172,7 @@ def test_search_counts_degraded_payload_and_aborts_before_delivery(client, paylo
     assert tools.lcm_recall.call_count == 1
     adapter.delete_all("u")
     assert json.loads((adapter._db_root / "search_status.json").read_text()) == {
-        "stage": "search", "payloads": 1, "degraded_payloads": 1,
+        "stage": "search", "payloads": 1, "degraded_payloads": 1, "adapter_version": 1,
     }
 
 
@@ -483,7 +483,7 @@ def test_error_payload_is_counted_as_not_clean(client, embeddings):
     with pytest.raises(SystemExit if embeddings else RuntimeError):
         adapter.search("question", "u", 20)
     assert json.loads((adapter._db_root / "search_status.json").read_text()) == {
-        "stage": "search", "payloads": 1, "degraded_payloads": 1,
+        "stage": "search", "payloads": 1, "degraded_payloads": 1, "adapter_version": 1,
     }
     assert adapter_module._ABORT.is_set() == embeddings
 

@@ -126,7 +126,7 @@ def test_search_stage_skip_flag_cannot_accept_timeout_or_run_queued_recalls(tmp_
         lme_search.main("lcmx", "abort", num_workers=workers, skip_failed_search=True)
     tools.lcm_recall.assert_called_once()
     assert json.loads((tmp_path / "results/lme/lcmx-abort/lcmx_recall_status.json").read_text()) == {
-        "stage": "search", "payloads": 1, "degraded_payloads": 1,
+        "stage": "search", "payloads": 1, "degraded_payloads": 1, "adapter_version": 1,
     }
 
 
@@ -199,7 +199,8 @@ def test_resumed_search_merges_counts_next_to_results_for_disjoint_questions(tmp
     lme_search.main("lcmx", "resume", num_workers=1)
     folder = tmp_path / "results/lme/lcmx-resume"
     path = folder / "lcmx_recall_status.json"
-    assert json.loads(path.read_text()) == {"stage": "search", "payloads": 1, "degraded_payloads": 0}
+    assert json.loads(path.read_text()) == {"stage": "search", "payloads": 1, "degraded_payloads": 0,
+                                            "adapter_version": 1}
     prior = json.loads(path.read_text())
     prior["retained_metadata"] = "from earlier run"
     path.write_text(json.dumps(prior))
@@ -207,6 +208,7 @@ def test_resumed_search_merges_counts_next_to_results_for_disjoint_questions(tmp
     lme_search.main("lcmx", "resume", num_workers=1)
     assert json.loads(path.read_text()) == {
         "stage": "search", "payloads": 2, "degraded_payloads": 0, "retained_metadata": "from earlier run",
+        "adapter_version": 1,
     }
     assert (folder / "lcmx_lme_search_results.json").is_file()
     assert [call.args[0]["query"] for call in tools.lcm_recall.call_args_list] == ["first question", "second question"]

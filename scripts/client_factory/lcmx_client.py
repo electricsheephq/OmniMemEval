@@ -46,6 +46,27 @@ def _safe(value):
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-._") or "user"
 
 
+def _adapter_version():
+    # Read per call (clients are built with __new__ in tests): 1 = aa7d96c output, 2 = role/time lines.
+    value = env_str("LCMX_ADAPTER_VERSION", "1") or "1"
+    if value not in ("1", "2"):
+        raise ValueError(f"LCMX_ADAPTER_VERSION must be 1 or 2, got {value!r}")
+    return int(value)
+
+
+def _epoch_seconds(value):
+    """Epoch seconds by the store's observed_at rule (numeric, or timezone-aware ISO-8601), else None."""
+    from datetime import datetime
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if value > 0 else None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.timestamp() if parsed.utcoffset() is not None else None
+
+
 def _user_lock(user_id):
     with _USER_LOCKS_GUARD:
         return _USER_LOCKS.setdefault(user_id, threading.Lock())
@@ -107,6 +128,8 @@ class LcmxClient:
         LCMX_DELIVERY        – "full" (default): full stored message per hit;
                                "snippet": lcm_recall's 300-char snippet
         LCMX_CATCHUP_MAX_PASSES – maintenance pass limit (default: 500)
+        LCMX_ADAPTER_VERSION – "1" (default): aa7d96c output; "2": speaker role
+                               on message lines, summary created_at = session time
         LCMX_EXTRA_ENTRIES   – "1": render lcm_recall extra entries (extra=true,
                                recall_extra_entries) after the top_k hits as
                                their window text only; off by default
@@ -221,7 +244,8 @@ class LcmxClient:
             key = f"config_set:{name}={value!r}"
             if key not in _CONFIG_SET_LOGGED:
                 _CONFIG_SET_LOGGED.add(key)
-                print(f"[lcmx] LCMX_CONFIG_SET applied: {name}={value!r}", file=sys.stderr)
+                print(f"[lcmx] LCMX_CONFIG_SET applied: {name}={value!r} adapter_version={_adapter_version()}",
+                      file=sys.stderr)
         return config
 
     def _open(self, user_id):
@@ -252,6 +276,7 @@ class LcmxClient:
                 no ``chat_time``.
         """
         _check_abort()
+        version = _adapter_version()  # refuse a bad value before any marker or row write
         if not messages:
             return
         session_key = (
@@ -310,7 +335,9 @@ class LcmxClient:
                         token_count=len(summary_text.split()),
                         source_token_count=sum(len(r["content"].split()) for r in rows_in),
                         source_type="messages",
-                        created_at=float(order),
+                        # v2: the session's event time when it parses; order stays in sessions.json.
+                        created_at=(_epoch_seconds(session_time) if version == 2 else None)
+                        or float(order),
                     )
                 )
                 if self._embeddings:
@@ -467,6 +494,7 @@ class LcmxClient:
         stage = json.loads(path.read_text()) if path.exists() else {"stage": "search", "payloads": 0, "degraded_payloads": 0}
         stage["payloads"] += 1
         stage["degraded_payloads"] += int(degraded)
+        stage["adapter_version"] = _adapter_version()
         atomic_json_dump(stage, path, indent=2)
         if degraded and self._embeddings:
             # Stage wrappers can turn Exception into a skipped question. This
@@ -512,8 +540,10 @@ class LcmxClient:
             fh.write(json.dumps(line, default=str) + "\n")
 
     def search(self, query, user_id, top_k):
-        """Run ``lcm_recall`` and return one ``[event_time] text`` line per hit."""
+        """Run ``lcm_recall`` and return one ``[event_time] text`` line per hit
+        (``[event_time] role: text`` with LCMX_ADAPTER_VERSION=2)."""
         _check_abort()
+        version = _adapter_version()
         self._require_healthy_store(user_id)
         if not self._db_path(user_id).exists():
             if self._embeddings:
@@ -570,6 +600,18 @@ class LcmxClient:
         if "error" in payload:
             raise RuntimeError(f"lcm_recall error: {payload['error']}")
         sessions = self._load_sessions(user_id)
+
+        def prefix(hit, row=None):
+            event_time = hit.get("event_time") or (
+                sessions.get(str(hit.get("session_id"))) or {}
+            ).get("time")
+            text = f"[{event_time}] " if event_time else ""
+            if hit.get("kind") == "summary":
+                return text + "(session summary) "
+            # v2 names the speaker from the hit, else the full stored row; never a guess.
+            role = (hit.get("role") or (row or {}).get("role")) if version == 2 else None
+            return text + (f"{role}: " if role else "")
+
         lines = []
         for hit in hits[:top_k]:
             row = full_rows.get(hit.get("store_id")) if hit.get("kind") != "summary" else None
@@ -581,24 +623,12 @@ class LcmxClient:
                 text = " ".join(snippet.split())
             if not text:
                 continue
-            event_time = hit.get("event_time") or (
-                sessions.get(str(hit.get("session_id"))) or {}
-            ).get("time")
-            prefix = f"[{event_time}] " if event_time else ""
-            if hit.get("kind") == "summary":
-                prefix += "(session summary) "
-            lines.append(prefix + text)
+            lines.append(prefix(hit, row) + text)
         for hit in extras:  # bounded by lcm-x (at most N); not cut at top_k
             text = " ".join(str(hit.get("window") or "").split())
             if not text:
                 continue
-            event_time = hit.get("event_time") or (
-                sessions.get(str(hit.get("session_id"))) or {}
-            ).get("time")
-            prefix = f"[{event_time}] " if event_time else ""
-            if hit.get("kind") == "summary":
-                prefix += "(session summary) "
-            lines.append(prefix + text)
+            lines.append(prefix(hit) + text)
         return "\n".join(lines)
 
     # -- delete ---------------------------------------------------------------
