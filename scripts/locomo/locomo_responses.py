@@ -158,6 +158,7 @@ async def main(
         locomo_search_results = json.load(file)
 
     indices = select_indices(locomo_df, "sample_id", f"results/locomo/{frame}-{version}", version)
+    num_users = len(indices)
     semaphore = asyncio.Semaphore(llm_workers)
 
     all_responses = {}

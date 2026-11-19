@@ -1,5 +1,6 @@
 """Synthetic-only tests for the R1 measurement switches."""
 
+import asyncio
 import hashlib
 import json
 import random
@@ -13,7 +14,7 @@ import pytest
 import tiktoken
 
 import client_factory
-from locomo import locomo_search
+from locomo import locomo_responses, locomo_search
 from longmemeval import lme_common
 from personamem_v2 import pm_common, pm_search
 from utils import evidence_delivery as delivery
@@ -208,6 +209,20 @@ def test_pair_cli_reports_first_differing_hit(tmp_path, offline_cli, capsys, rep
     assert result["first_differing_hits"] == expected[replica_hit]
 
 
+@pytest.mark.parametrize("hit, code, scored, delivered", [
+    (None, 2, 0, 0), ("unrelated", 2, 1, 0), ("second", 0, 1, 1)])
+def test_pair_cli_refuses_a_vacuous_pass(tmp_path, offline_cli, capsys, hit, code, scored, delivered):
+    rows = [] if hit is None else [dict(question_id="q1", category="multi-session",
+                                        search_context=f"first\n{hit}", answer_evidences=["user : second"])]
+    for name in ("a.json", "replica.json"):
+        (tmp_path / name).write_text(json.dumps({name: rows}), encoding="utf-8")
+    assert offline_cli(["pair", str(tmp_path / "a.json"), str(tmp_path / "replica.json")]) == code
+    result = json.loads(capsys.readouterr().out)
+    assert (result["discordant_questions"], result["vacuous"]) == (0, code == 2)
+    side = dict(scored_questions=scored, questions_with_delivered_evidence=delivered)
+    assert result["counts"] == {"a": side, "a_prime": side}
+
+
 def test_same_store_version_refused_before_cache_lookup(monkeypatch):
     monkeypatch.setenv("R1_STORE_VERSION", "baseline")
     with pytest.raises(ValueError, match="differ from --version"):
@@ -289,3 +304,44 @@ def test_locomo_golden_and_opt_in_gold_capture(monkeypatch, encoding):
     assert row["evidence"] == ["D1:1"]
     assert row["evidence_turns"] == {"D1:1": "A: a fact"}
     assert delivery.score(results, encoding)["sample:0"][1][4096, "strict"] == ["verbatim"]
+
+
+def test_pm_search_writes_then_reuses_a_row_result(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    search = Mock(return_value="raw")
+    monkeypatch.setattr(client_factory, "create_client", Mock())
+    monkeypatch.setattr(pm_search, "dispatch_search", search)
+    monkeypatch.setattr(pm_search, "unpack_search_result", lambda result: ("[time] a fact", 1.0, None, None))
+    row = dict(persona_id="2", user_query="{'role': 'user', 'content': 'q'}", pref_type="pref",
+               topic_query="topic", correct_answer="correct", incorrect_answers='["one", "two", "three"]',
+               related_conversation_snippet='[{"role":"user","content":"a fact"}]')
+    first, blocking = pm_search.process_user(row, 7, "lcmx", "r1")
+    assert not blocking and search.call_count == 1
+    assert Path("results/pmv2/lcmx-r1/tmp/lcmx_pm_search_results_7.json").exists()
+    second, blocking = pm_search.process_user(row, 7, "lcmx", "r1")
+    assert not blocking and search.call_count == 1
+    assert "Using existing results for row 7" in capsys.readouterr().out
+    assert second == json.loads(json.dumps(first))
+
+
+def test_locomo_responses_answers_a_pending_question(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    results = Path("results/locomo/lcmx-r1")
+    results.mkdir(parents=True)
+    (results / "lcmx_locomo_search_results.json").write_text(json.dumps({"locomo_exp_user_0": [
+        {"query": "q", "context": "[time] a fact", "duration_ms": 1.0, "status": "success"}]}))
+    record = dict(question="q", answer="answer", category=1, golden_answer="gold",
+                  response_duration_ms=1.0, search_duration_ms=1.0, status="success")
+
+    async def answer(*args):
+        return record
+
+    data = pd.DataFrame([{"sample_id": "sample", "qa": [{"question": "q", "answer": "gold", "category": 1}]}])
+    monkeypatch.setattr(locomo_responses, "load_env", Mock())
+    monkeypatch.setitem(sys.modules, "utils.llm_client",
+                        SimpleNamespace(create_async_openai_client=lambda module: (Mock(), "synthetic")))
+    monkeypatch.setattr(locomo_responses, "process_qa", answer)
+    monkeypatch.setattr(locomo_responses, "pd", SimpleNamespace(read_json=lambda path: data))
+    asyncio.run(locomo_responses.main("lcmx", "r1"))
+    saved = json.loads((results / "lcmx_locomo_responses.json").read_text())
+    assert saved == {"locomo_exp_user_0": [record]}

@@ -125,9 +125,16 @@ def main(argv=None):
         return 0
     replica = score(json.loads(args.replica.read_text(encoding="utf-8")), encoding)
     discordant = dict(pair(rows, replica))
+    # An A/A' pass needs both sides to have scored and delivered something; otherwise it is vacuous.
+    counts = {side: dict(scored_questions=len(scored), questions_with_delivered_evidence=sum(
+        any(label != "none" for labels in scores.values() for label in labels) for _, scores, _ in scored.values()))
+        for side, scored in (("a", rows), ("a_prime", replica))}
+    vacuous = any(not side["scored_questions"] or not side["questions_with_delivered_evidence"]
+                  for side in counts.values())
     print(json.dumps(dict(summary_coverage="pending-adapter-hook", warning=WARNING,
-                          discordant_questions=len(discordant), first_differing_hits=discordant), indent=2))
-    return int(bool(discordant))
+                          discordant_questions=len(discordant), first_differing_hits=discordant,
+                          counts=counts, vacuous=vacuous), indent=2))
+    return 1 if discordant else 2 if vacuous else 0
 
 
 if __name__ == "__main__":

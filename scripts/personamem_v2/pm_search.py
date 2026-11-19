@@ -233,7 +233,6 @@ def process_user(
 
 
 def load_existing_results(frame, version, row_idx):
-    tmp_dir = checkpoint_dir(f"results/pmv2/{frame}-{version}", version, search=True) / "tmp"
     result_path = f"results/pmv2/{frame}-{version}/tmp/{frame}_pm_search_results_{row_idx}.json"
     if os.path.exists(result_path):
         try:
