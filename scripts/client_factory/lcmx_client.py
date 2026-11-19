@@ -56,15 +56,20 @@ def _adapter_version():
 
 def _epoch_seconds(value):
     """Epoch seconds by the store's observed_at rule (numeric, or timezone-aware ISO-8601), else None."""
+    import math
     from datetime import datetime
 
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value) if value > 0 else None
-    try:
-        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-    except ValueError:
+    if value is None or isinstance(value, bool):
         return None
-    return parsed.timestamp() if parsed.utcoffset() is not None else None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        seconds = parsed.timestamp() if parsed.utcoffset() is not None else None
+    return seconds if seconds is not None and math.isfinite(seconds) and seconds > 0 else None
 
 
 def _user_lock(user_id):
@@ -129,7 +134,10 @@ class LcmxClient:
                                "snippet": lcm_recall's 300-char snippet
         LCMX_CATCHUP_MAX_PASSES – maintenance pass limit (default: 500)
         LCMX_ADAPTER_VERSION – "1" (default): aa7d96c output; "2": speaker role
-                               on message lines, summary created_at = session time
+                               on message lines, summary created_at = session time.
+                               The role comes from the full stored row (lcm_recall's
+                               default detail carries none), so v2 shows no role under
+                               LCMX_DELIVERY=snippet or for extra entries
         LCMX_EXTRA_ENTRIES   – "1": render lcm_recall extra entries (extra=true,
                                recall_extra_entries) after the top_k hits as
                                their window text only; off by default

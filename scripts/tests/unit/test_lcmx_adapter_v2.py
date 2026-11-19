@@ -114,6 +114,8 @@ def test_invalid_version_refused(monkeypatch, tmp_path):
     (None, "2023-05-08T18:30:00Z", 1.0),
     ("2", "2023-05-08T18:30:00Z", 1683570600.0),
     ("2", "2023-05-08T18:30:00+07:00", 1683545400.0),
+    ("2", " 1683570600 ", 1683570600.0),  # numeric string: the store accepts it too
+    ("2", "nan", 1.0),
     ("2", "1:56 pm on 8 May, 2023", 1.0),  # not a time: keep the order
     ("2", "2023-05-08T18:30:00", 1.0),  # naive: the store rejects it too
     ("2", None, 1.0),
