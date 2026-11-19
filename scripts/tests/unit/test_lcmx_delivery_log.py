@@ -96,6 +96,7 @@ def test_on_and_off_return_identical_text_and_off_writes_nothing(monkeypatch, tm
 def test_record_follows_rendered_order(monkeypatch, tmp_path):
     monkeypatch.setenv("LCMX_ADAPTER_VERSION", "2")
     monkeypatch.setenv("LCMX_EXTRA_ENTRIES", "1")
+    monkeypatch.setenv("LCMX_ARM", "arm-a")
     log = tmp_path / "delivery.jsonl"
     monkeypatch.setenv("LCMX_DELIVERY_LOG", str(log))
     dag = FakeDag()
@@ -103,6 +104,8 @@ def test_record_follows_rendered_order(monkeypatch, tmp_path):
     rendered = text.split("\n")
     record = json.loads(log.read_text())
     assert dag.calls == [(11, sys.maxsize), (12, sys.maxsize)]  # never truncated
+    assert isinstance(record.pop("ts"), float) and record.pop("pid") == os.getpid()
+    assert record.pop("arm") == "arm-a"
     assert record == {
         "user_id": "u",
         "query_sha256": hashlib.sha256(b"secret question").hexdigest(),
@@ -131,6 +134,7 @@ def test_records_are_whole_lines_under_concurrency(monkeypatch, tmp_path):
     monkeypatch.delenv("LCMX_EXTRA_ENTRIES", raising=False)
     log = tmp_path / "delivery.jsonl"
     monkeypatch.setenv("LCMX_DELIVERY_LOG", str(log))
+    monkeypatch.delenv("LCMX_ARM", raising=False)
     c = _client(monkeypatch, tmp_path, HITS)
     users, threads_per_user, calls = ["a", "b", "c"], 4, 25
     errors = []
@@ -150,6 +154,7 @@ def test_records_are_whole_lines_under_concurrency(monkeypatch, tmp_path):
     assert errors == []
     records = [json.loads(line) for line in log.read_text().splitlines()]
     assert len(records) == len(users) * threads_per_user * calls
+    assert {r["arm"] for r in records} == {None} and {r["pid"] for r in records} == {os.getpid()}
     for user in users:  # per-user call_index is dense and in file order
         assert [r["call_index"] for r in records if r["user_id"] == user] == list(range(threads_per_user * calls))
 

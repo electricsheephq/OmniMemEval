@@ -174,6 +174,7 @@ class LcmxClient:
         LCMX_DELIVERY_LOG    – absolute path to a .jsonl file: each search() appends
                                one record of the lines it returned, in order (see
                                _log_delivery); off by default
+        LCMX_ARM             – optional label copied into each delivery record
         FASTEMBED_CACHE_PATH / LCM_LONGMEMEVAL_FASTEMBED_CACHE – model cache
         TIKTOKEN_CACHE_DIR  – populated tokenizer cache (set by the job)
     """
@@ -594,6 +595,8 @@ class LcmxClient:
             index = _DELIVERY_CALLS.get(user_id, 0)
             _DELIVERY_CALLS[user_id] = index + 1
             record = {
+                # ts, pid and arm (LCMX_ARM, else null) tell apart two arms or a resumed stage sharing one log.
+                "ts": time.time(), "pid": os.getpid(), "arm": env_str("LCMX_ARM", "") or None,
                 "user_id": user_id,
                 "query_sha256": hashlib.sha256(str(query).encode("utf-8")).hexdigest(),
                 "call_index": index, "adapter_version": version,
