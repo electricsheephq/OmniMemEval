@@ -5,6 +5,10 @@ from itertools import chain, zip_longest
 from pathlib import Path
 
 BUDGETS = (4096, 8192, 16384)
+VERBATIM_PREFIX = "deterministic_session_summary:"
+NOT_APPLICABLE = ("not applicable to this adapter; its summaries are verbatim session prefixes "
+                  "(deterministic_session_summary, at most {} chars), so evidence they deliver counts as verbatim; "
+                  "a summary class applies only to an arm with condensed summaries")
 WARNING = ("Verbatim-only undercounts evidence carried by summaries and must not gate "
            "any flip that changes the summary/raw mix.")
 
@@ -90,11 +94,25 @@ def aggregates(rows):
                 yield result
 
 
-def write_reports(prefix, rows, arm):
+def coverage(search):
+    """(summary_coverage, warning) for one arm, from its adapter's declaration beside the search results.
+    Only an adapter that declares verbatim session prefixes gets 'not applicable'; any other arm keeps the warning."""
+    try:
+        mode = json.loads(Path(search).with_name("lcmx_recall_status.json").read_text(encoding="utf-8"))["summary_mode"]
+    except (OSError, ValueError, KeyError, TypeError):
+        mode = None
+    chars = mode[len(VERBATIM_PREFIX):] if isinstance(mode, str) and mode.startswith(VERBATIM_PREFIX) else ""
+    return (NOT_APPLICABLE.format(chars), None) if chars.isdigit() else ("pending-adapter-hook", WARNING)
+
+
+def write_reports(prefix, rows, arm, stamp=("pending-adapter-hook", WARNING)):
     results = list(aggregates(rows))
-    report = dict(arm=arm, summary_coverage="pending-adapter-hook", warning=WARNING, results=results)
+    summary_coverage, warning = stamp
+    report = dict(arm=arm, summary_coverage=summary_coverage, warning=warning, results=results)
     Path(f"{prefix}.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    lines = [f"# Evidence delivery ({arm})", "", f"> **Warning:** {WARNING} (`summary_coverage: pending-adapter-hook`)", "",
+    head = (f"> **Warning:** {warning} (`summary_coverage: {summary_coverage}`)" if warning
+            else f"> `summary_coverage: {summary_coverage}`")
+    lines = [f"# Evidence delivery ({arm})", "", head, "",
              "| Category | Tokens | Match | Questions | Items | Verbatim recall | Verbatim all | V+S recall | V+S all |",
              "|---|---:|---|---:|---:|---:|---:|---:|---:|"]
     for row in results:
@@ -121,7 +139,7 @@ def main(argv=None):
     encoding = get_encoding()
     rows = score(json.loads(args.search.read_text(encoding="utf-8")), encoding)
     if args.command == "score":
-        write_reports(args.output_prefix, rows, args.arm)
+        write_reports(args.output_prefix, rows, args.arm, coverage(args.search))
         return 0
     replica = score(json.loads(args.replica.read_text(encoding="utf-8")), encoding)
     discordant = dict(pair(rows, replica))
@@ -131,7 +149,9 @@ def main(argv=None):
         for side, scored in (("a", rows), ("a_prime", replica))}
     vacuous = any(not side["scored_questions"] or not side["questions_with_delivered_evidence"]
                   for side in counts.values())
-    print(json.dumps(dict(summary_coverage="pending-adapter-hook", warning=WARNING,
+    stamps = {coverage(args.search), coverage(args.replica)}
+    summary_coverage, warning = stamps.pop() if len(stamps) == 1 else ("pending-adapter-hook", WARNING)
+    print(json.dumps(dict(summary_coverage=summary_coverage, warning=warning,
                           discordant_questions=len(discordant), first_differing_hits=discordant,
                           counts=counts, vacuous=vacuous), indent=2))
     return 1 if discordant else 2 if vacuous else 0
