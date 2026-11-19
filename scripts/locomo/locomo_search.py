@@ -15,6 +15,8 @@ from time import time
 
 import pandas as pd
 
+from utils.splits import select_indices
+from utils.r1_run import store_version
 from utils.env import load_env
 from utils.checkpoint import atomic_json_dump
 from utils.progress import track
@@ -358,15 +360,16 @@ def process_user(
     conversation = locomo_df["conversation"].iloc[conv_idx]
     speaker_a = conversation.get("speaker_a")
     speaker_b = conversation.get("speaker_b")
-    speaker_a_user_id = f"locomo_exp_user_{conv_idx}_speaker_a_{version}"
-    speaker_b_user_id = f"locomo_exp_user_{conv_idx}_speaker_b_{version}"
+    store = store_version(version)
+    speaker_a_user_id = f"locomo_exp_user_{conv_idx}_speaker_a_{store}"
+    speaker_b_user_id = f"locomo_exp_user_{conv_idx}_speaker_b_{store}"
     conv_id = group_id_for(conv_idx)
 
     group_id = None
     if frame == "zep":
         zep_use_group = os.environ.get("ZEP_USE_GROUP", "true").lower() in ("true", "1", "yes")
         if zep_use_group:
-            group_id = f"locomo_exp_group_{conv_idx}_{version}"
+            group_id = f"locomo_exp_group_{conv_idx}_{store}"
 
     existing_results, loaded = load_existing_results(
         frame,
@@ -457,6 +460,15 @@ def process_user(
             results_by_index[idx] = result
 
     records = [results_by_index[idx] for idx in sorted(results_by_index)]
+    if os.getenv("R1_EVIDENCE") == "1":
+        turns = {turn["dia_id"]: f"{turn['speaker']}: {turn['text']}"
+                 for session in conversation.values() if isinstance(session, list)
+                 for turn in session if "dia_id" in turn}
+        for idx, (record, qa) in enumerate(zip(records, eval_qas, strict=True)):
+            evidence = qa.get("evidence") or []
+            record.update(question_id=f"{locomo_df['sample_id'].iloc[conv_idx]}:{idx}",
+                          category=qa["category"], evidence=evidence,
+                          evidence_turns={key: turns[key] for key in evidence if key in turns})
     search_results[conv_id].extend(records)
 
     allowed_statuses = search_allowed_statuses(
@@ -501,13 +513,14 @@ def main(
 ):
     load_env()
     locomo_df = pd.read_json(os.getenv("LOCOMO_DATA_PATH") or "data/locomo/locomo10.json")
-    num_users = len(locomo_df)
+    indices = select_indices(locomo_df, "sample_id", f"results/locomo/{frame}-{version}", version)
+    num_users = len(indices)
     os.makedirs(f"results/locomo/{frame}-{version}/", exist_ok=True)
     all_search_results = defaultdict(list)
 
     failed_users = []
     all_status_records = []
-    for idx in range(num_users):
+    for idx in indices:
         print(f"\n[{idx + 1}/{num_users}] Processing user {idx}")
         try:
             user_results, blocking_records = process_user(

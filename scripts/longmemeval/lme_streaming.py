@@ -43,6 +43,7 @@ from longmemeval.lme_data import load_lme_dataframe, sanitize_lme_message_conten
 from longmemeval.lme_ingestion import ingest_session
 from utils.checkpoint import atomic_json_dump, fsync_write_line
 from utils.duration_stats import update_unit_duration_list
+from utils.splits import select_indices
 from utils.env import load_env
 from utils.ingest_helpers import AddCallTimer
 from utils.response_options import parse_bool
@@ -962,10 +963,11 @@ def main() -> int:
 
     results_dir = _results_dir(args.lib, args.version)
     results_dir.mkdir(parents=True, exist_ok=True)
-    (results_dir / "tmp").mkdir(parents=True, exist_ok=True)
 
     lme_df = load_lme_dataframe()
-    write_question_id_map(lme_df.to_dict("records"), args.lib, args.version)
+    indices = select_indices(lme_df, "question_id", results_dir, args.version)
+    (results_dir / "tmp").mkdir(parents=True, exist_ok=True)
+    write_question_id_map(lme_df.to_dict("records"), args.lib, args.version, indices)
     total = len(lme_df)
     end_idx = args.end_idx if args.end_idx is not None else total - 1
     if args.start_idx < 0 or end_idx >= total or end_idx < args.start_idx:
@@ -1004,6 +1006,8 @@ def main() -> int:
     failed_users: list[dict] = []
     skipped_records: list[dict] = []
     for conv_idx in range(args.start_idx, end_idx + 1):
+        if conv_idx not in indices:
+            continue
         if conv_idx in completed and not args.no_resume:
             print(f"Skipping conversation {conv_idx}: already completed")
             continue

@@ -54,6 +54,8 @@ from personamem_v2.pm_common import (  # noqa: E402
 )
 from utils.checkpoint import atomic_json_dump  # noqa: E402
 from utils.duration_stats import update_unit_duration_list  # noqa: E402
+from utils.r1_run import store_version
+from utils.splits import select_indices
 from utils.env import load_env  # noqa: E402
 from utils.ingest_helpers import AddCallTimer  # noqa: E402
 from utils.response_options import parse_bool  # noqa: E402
@@ -113,7 +115,7 @@ def _added_chunks_path(frame: str, version: str, persona_id: int) -> Path:
 
 
 def user_id_for(version: str, persona_id: int) -> str:
-    return f"pm_exper_user_{persona_id}_{version}"
+    return f"pm_exper_user_{persona_id}_{store_version(version)}"
 
 
 def result_key_for(version: str, row_idx: int) -> str:
@@ -366,6 +368,7 @@ def search_persona_rows(
         entry = build_search_entry(
             result_key=result_key,
             persona_id=persona_id,
+            related_conversation_snippet=row_data.get("related_conversation_snippet"),
             row_idx=row_idx,
             question=question,
             category=pref_type,
@@ -629,6 +632,7 @@ def mark_streaming_failure_skipped(
         entry = build_search_entry(
             result_key=result_key,
             persona_id=persona_id,
+            related_conversation_snippet=row_data.get("related_conversation_snippet"),
             row_idx=row_idx,
             question=question,
             category=row_data["pref_type"],
@@ -710,11 +714,12 @@ def main() -> int:
 
     results_dir = _results_dir(args.lib, args.version)
     results_dir.mkdir(parents=True, exist_ok=True)
-    (results_dir / "tmp").mkdir(parents=True, exist_ok=True)
 
     chat_history_index = build_chat_history_index(CHAT_HISTORY_DIR)
     benchmark_personas = load_benchmark_personas(BENCHMARK_CSV)
-    missing_personas = sorted(set(benchmark_personas) - set(chat_history_index))
+    selected = set(select_indices(benchmark_personas, None, results_dir, args.version))
+    (results_dir / "tmp").mkdir(parents=True, exist_ok=True)
+    missing_personas = sorted(selected - set(chat_history_index))
     if missing_personas and not args.allow_missing_data:
         raise SystemExit(
             f"Missing PersonaMem chat history files for {len(missing_personas)} "
@@ -760,6 +765,8 @@ def main() -> int:
     skipped_records: list[dict] = []
     for row_pos in range(args.start_idx, end_idx + 1):
         persona_id = available_personas[row_pos]
+        if persona_id not in selected:
+            continue
         restart_unit = args.restart_unit or (
             args.no_resume and str(persona_id) in existing_completed
         )

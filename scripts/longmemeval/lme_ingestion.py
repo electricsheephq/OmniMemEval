@@ -8,6 +8,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+from utils.r1_run import store_version
+from utils.splits import select_indices
 from utils.env import load_env
 from utils.progress import track
 from utils.time import parse_lme_time, to_iso
@@ -101,6 +103,7 @@ def ingest_conv(lme_df, version, conv_idx, frame, success_records, f, clear=Fals
     sessions = conversation["haystack_sessions"]
     dates = conversation["haystack_dates"]
 
+    version = store_version(version)
     user_id = f"lme_exper_user_{version}_{conv_idx}"
 
     print("\n" + "=" * 80)
@@ -210,8 +213,9 @@ def main(frame, version, num_workers=2, clear=False):
         print("🧹 --clear enabled: will delete existing memories before ingestion")
 
     lme_df = load_lme_dataframe()
+    indices = select_indices(lme_df, "question_id", f"results/lme/{frame}-{version}", version)
 
-    num_multi_sessions = len(lme_df)
+    num_multi_sessions = len(indices)
     print(f"👥 Number of users: {num_multi_sessions}")
     print("-" * 80)
 
@@ -232,7 +236,7 @@ def main(frame, version, num_workers=2, clear=False):
     failed_conversations = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor, open(record_file, "a+") as f:
         future_to_idx = {}
-        for session_idx in range(num_multi_sessions):
+        for session_idx in indices:
             future = executor.submit(
                 ingest_conv, lme_df, version, session_idx, frame, success_records, f, clear
             )

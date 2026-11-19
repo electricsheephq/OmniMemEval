@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from utils.checkpoint import atomic_json_dump
+from utils.r1_run import store_version
 
 
-def write_question_id_map(rows, frame: str, version: str) -> None:
+def write_question_id_map(rows, frame: str, version: str, indices=None) -> None:
     """Join search, answer and judge files by their stable user_id keys."""
-    mapping = {user_id_for(version, idx): row["question_id"] for idx, row in enumerate(rows)}
+    indices = range(len(rows)) if indices is None else indices
+    mapping = {user_id_for(version, idx): rows[idx]["question_id"] for idx in indices}
     ids = list(mapping.values())
     if any(not isinstance(qid, str) or not qid for qid in ids) or len(set(ids)) != len(ids):
         raise ValueError("LME requires nonempty, unique original question_id values")
@@ -37,7 +39,7 @@ def utc_now_iso() -> str:
 
 
 def user_id_for(version: str, conv_idx: int) -> str:
-    return f"lme_exper_user_{version}_{conv_idx}"
+    return f"lme_exper_user_{store_version(version)}_{conv_idx}"
 
 
 def record_status(record: Mapping[str, Any] | None) -> str:
