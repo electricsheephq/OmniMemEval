@@ -6,9 +6,11 @@ validation without changing retrieval, answer extraction, or metric formulas.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
+from utils.r1_run import store_version
 from utils.pipeline_status import (
     STATUS_FAILED,
     STATUS_SKIPPED,
@@ -23,7 +25,7 @@ from utils.pipeline_status import (
 
 
 def memory_user_id_for(version: str, persona_id: int | str) -> str:
-    return f"pm_exper_user_{persona_id}_{version}"
+    return f"pm_exper_user_{persona_id}_{store_version(version)}"
 
 
 def result_key_for(version: str, row_idx: int | str) -> str:
@@ -43,6 +45,7 @@ def build_search_entry(
     context: str,
     duration_ms: float,
     status: str,
+    related_conversation_snippet: str | None = None,
     reflect_answer: str | None = None,
     error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -60,6 +63,8 @@ def build_search_entry(
         "search_duration_ms": duration_ms,
         "status": status,
     }
+    if os.getenv("R1_EVIDENCE") == "1":
+        entry["related_conversation_snippet"] = related_conversation_snippet
     if reflect_answer is not None:
         entry["reflect_answer"] = reflect_answer
     if error is not None:

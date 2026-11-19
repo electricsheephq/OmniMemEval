@@ -13,6 +13,8 @@ sys.path.insert(0, SCRIPT_DIR)
 
 import pandas as pd
 
+from utils.splits import select_indices
+from utils.r1_run import store_version
 from utils.env import load_env
 from utils.progress import track
 from utils.time import parse_locomo_time, to_iso, to_unix
@@ -216,6 +218,7 @@ def process_user(conv_idx, frame, locomo_df, version, success_records, f, clear=
     start_time = time.time()
     total_session_time = 0
     valid_sessions = 0
+    version = store_version(version)
     speaker_a_user_id = f"locomo_exp_user_{conv_idx}_speaker_a_{version}"
     speaker_b_user_id = f"locomo_exp_user_{conv_idx}_speaker_b_{version}"
 
@@ -313,7 +316,8 @@ def process_user(conv_idx, frame, locomo_df, version, success_records, f, clear=
 def main(frame, version="default", num_workers=2, clear=False):
     load_env()
     locomo_df = pd.read_json(os.getenv("LOCOMO_DATA_PATH") or "data/locomo/locomo10.json")
-    num_users = len(locomo_df)
+    indices = select_indices(locomo_df, "sample_id", f"results/locomo/{frame}-{version}", version)
+    num_users = len(indices)
     start_time = time.time()
     total_time = 0
     print(
@@ -341,7 +345,7 @@ def main(frame, version="default", num_workers=2, clear=False):
     ):
         future_to_uid = {
             executor.submit(process_user, uid, frame, locomo_df, version, success_records, f, clear): uid
-            for uid in range(num_users)
+            for uid in indices
         }
         for future in track(
             concurrent.futures.as_completed(future_to_uid),

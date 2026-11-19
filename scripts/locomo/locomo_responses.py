@@ -14,6 +14,7 @@ from time import time
 
 import pandas as pd
 
+from utils.splits import select_indices
 from utils.env import load_env
 from utils.checkpoint import atomic_json_dump
 from utils.prompts import LOCOMO_ANSWER_PROMPT
@@ -156,7 +157,7 @@ async def main(
     with open(search_path) as file:
         locomo_search_results = json.load(file)
 
-    num_users = len(locomo_df)
+    indices = select_indices(locomo_df, "sample_id", f"results/locomo/{frame}-{version}", version)
     semaphore = asyncio.Semaphore(llm_workers)
 
     all_responses = {}
@@ -171,7 +172,7 @@ async def main(
             all_responses = {}
 
     total_questions = 0
-    for group_idx in range(num_users):
+    for group_idx in indices:
         qa_set = locomo_df["qa"].iloc[group_idx]
 
         group_id = group_id_for(group_idx)

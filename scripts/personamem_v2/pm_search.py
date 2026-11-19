@@ -27,6 +27,7 @@ from personamem_v2.pm_common import (
     validate_single_search_result,
 )
 from utils.checkpoint import atomic_json_dump
+from utils.splits import select_indices
 from utils.env import load_env
 from utils.progress import track
 from utils.response_options import parse_bool
@@ -49,12 +50,14 @@ def build_chat_history_index(chat_history_dir):
 
 
 def build_options(correct_answer, incorrect_answers_str, row_idx):
-    random.seed(row_idx)
+    rng = random.Random(row_idx) if os.getenv("R1_LOCAL_RNG") == "1" else random
+    if rng is random:
+        random.seed(row_idx)
     incorrect_answers = json.loads(incorrect_answers_str)
     all_answers = [("correct", correct_answer)] + [
         ("incorrect", ans) for ans in incorrect_answers
     ]
-    random.shuffle(all_answers)
+    rng.shuffle(all_answers)
 
     option_labels = ["a", "b", "c", "d"]
     correct_label = None
@@ -175,6 +178,7 @@ def process_user(
         status = STATUS_SKIPPED if skip_failed_search else STATUS_FAILED
         entry = build_search_entry(
             result_key=result_key,
+            related_conversation_snippet=row_data.get("related_conversation_snippet"),
             persona_id=persona_id,
             row_idx=row_idx,
             question=question,
@@ -196,6 +200,7 @@ def process_user(
         )
         entry = build_search_entry(
             result_key=result_key,
+            related_conversation_snippet=row_data.get("related_conversation_snippet"),
             persona_id=persona_id,
             row_idx=row_idx,
             question=question,
@@ -228,6 +233,7 @@ def process_user(
 
 
 def load_existing_results(frame, version, row_idx):
+    tmp_dir = checkpoint_dir(f"results/pmv2/{frame}-{version}", version, search=True) / "tmp"
     result_path = f"results/pmv2/{frame}-{version}/tmp/{frame}_pm_search_results_{row_idx}.json"
     if os.path.exists(result_path):
         try:
@@ -256,7 +262,8 @@ def main(
 
     chat_history_index = build_chat_history_index(CHAT_HISTORY_DIR)
     benchmark_personas = load_benchmark_persona_ids(BENCHMARK_CSV)
-    missing_personas = sorted(set(benchmark_personas) - set(chat_history_index))
+    selected = set(select_indices(benchmark_personas, None, f"results/pmv2/{frame}-{version}", version))
+    missing_personas = sorted(selected - chat_history_index.keys())
     if missing_personas and not allow_missing_data:
         print(
             f"❌ Missing PersonaMem chat history files for {len(missing_personas)} "
@@ -264,7 +271,7 @@ def main(
         )
         print("Use --allow-missing-data 1 to explicitly evaluate the available subset.")
         raise SystemExit(1)
-    benchmark_rows = load_benchmark_rows(BENCHMARK_CSV, chat_history_index)
+    benchmark_rows = load_benchmark_rows(BENCHMARK_CSV, chat_history_index.keys() & selected)
     total_rows = len(benchmark_rows)
 
     print(f"  Loaded {total_rows} questions with available chat histories")

@@ -375,6 +375,9 @@ save_experiment_config() {
         echo "git_branch=$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
         echo "git_dirty=$(git -C "$PROJECT_DIR" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
     } >> "$dest/experiment_config.sh"
+    if [[ "${LIB:-}" == lcmx ]]; then
+        PYTHONPATH="$PROJECT_DIR/scripts${PYTHONPATH:+:$PYTHONPATH}" python -B -c 'import sys; from utils.env import load_env; from utils.r1_run import pin_build; load_env(); pin_build(sys.argv[1])' "$dest"
+    fi
 
     # 3) Snapshot of env file (mask sensitive values)
     sed -E 's/(.*(_KEY|_SECRET|_TOKEN|_PASSWORD)=).*/\1***/' "$OMNIMEMEVAL_ENV_FILE" > "$dest/snapshot_eval.env"

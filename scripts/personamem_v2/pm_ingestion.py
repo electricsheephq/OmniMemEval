@@ -10,6 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+from utils.r1_run import store_version
+from utils.splits import select_indices
 from utils.env import load_env
 from utils.progress import track
 from utils.checkpoint import atomic_json_dump, fsync_write_line
@@ -105,6 +107,7 @@ def ingest_persona(persona_id, chat_history_path, version, frame, success_record
         return persona_id, 0, []
 
     persona_start = _time.time()
+    version = store_version(version)
     user_id = f"pm_exper_user_{persona_id}_{version}"
 
     print(f"\n{'=' * 80}")
@@ -157,6 +160,8 @@ def ingest_persona(persona_id, chat_history_path, version, frame, success_record
 
 def main(frame, version, num_workers=2, clear=False, allow_missing_data=False):
     load_env()
+    benchmark_personas = load_benchmark_personas(BENCHMARK_CSV)
+    selected = set(select_indices(benchmark_personas, None, f"results/pmv2/{frame}-{version}", version))
 
     os.makedirs(f"results/pmv2/{frame}-{version}/", exist_ok=True)
     record_file = f"results/pmv2/{frame}-{version}/success_records.txt"
@@ -172,15 +177,14 @@ def main(frame, version, num_workers=2, clear=False, allow_missing_data=False):
     chat_history_index = build_chat_history_index(CHAT_HISTORY_DIR)
     print(f"  Found {len(chat_history_index)} chat history files in {CHAT_HISTORY_DIR}")
 
-    benchmark_personas = load_benchmark_personas(BENCHMARK_CSV)
     print(f"  Found {len(benchmark_personas)} unique personas in benchmark")
 
     available_personas = {
         pid: info
         for pid, info in benchmark_personas.items()
-        if pid in chat_history_index
+        if pid in chat_history_index and pid in selected
     }
-    missing_count = len(benchmark_personas) - len(available_personas)
+    missing_count = len(selected) - len(available_personas)
     print(f"  Available (with chat history): {len(available_personas)}")
     if missing_count > 0:
         print(f"  Missing chat history files: {missing_count} personas (will be skipped)")

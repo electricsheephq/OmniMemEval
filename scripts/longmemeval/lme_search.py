@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+from utils.splits import select_indices
 from utils.env import load_env
 from utils.checkpoint import atomic_json_dump
 from utils.progress import track
@@ -171,8 +172,9 @@ def main(
     print("=" * 80)
 
     lme_df = load_lme_dataframe()
-    write_question_id_map(lme_df.to_dict("records"), frame, version)
-    num_multi_sessions = len(lme_df)
+    indices = select_indices(lme_df, "question_id", f"results/lme/{frame}-{version}", version)
+    write_question_id_map(lme_df.to_dict("records"), frame, version, indices)
+    num_multi_sessions = len(indices)
     print(f"👥 Number of users: {num_multi_sessions}")
     print(f"⚙️  Search parameters: top_k={top_k}, workers={num_workers}")
     print("-" * 80)
@@ -194,7 +196,7 @@ def main(
                 allow_empty_search=allow_empty_search,
                 skip_failed_search=skip_failed_search,
             ): idx
-            for idx in range(num_multi_sessions)
+            for idx in indices
         }
 
         for future in track(
