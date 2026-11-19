@@ -26,6 +26,7 @@ _ABORT = threading.Event()
 _ABORT_MESSAGE = None
 _ABORT_LOCK = threading.Lock()
 _CONFIG_SET_LOGGED = set()
+_DELIVERY_CALLS = {}  # user_id -> delivery records written by this process
 
 
 def _abort(message, *, rebuild=False):
@@ -52,6 +53,18 @@ def _adapter_version():
     if value not in ("1", "2"):
         raise ValueError(f"LCMX_ADAPTER_VERSION must be 1 or 2, got {value!r}")
     return int(value)
+
+
+def _delivery_log_path():
+    # Read per call like _adapter_version; None when LCMX_DELIVERY_LOG is unset.
+    raw = env_str("LCMX_DELIVERY_LOG", "") or ""
+    if not raw:
+        return None
+    path = Path(raw)
+    if (not path.is_absolute() or path.suffix != ".jsonl" or path.is_dir()
+            or not path.parent.is_dir() or not os.access(path.parent, os.W_OK)):
+        raise ValueError(f"LCMX_DELIVERY_LOG must be an absolute .jsonl file path in a writable directory, got {raw!r}")
+    return path
 
 
 def _epoch_seconds(value):
@@ -158,6 +171,9 @@ class LcmxClient:
         LCMX_EXTRA_ENTRIES   – "1": render lcm_recall extra entries (extra=true,
                                recall_extra_entries) after the top_k hits as
                                their window text only; off by default
+        LCMX_DELIVERY_LOG    – absolute path to a .jsonl file: each search() appends
+                               one record of the lines it returned, in order (see
+                               _log_delivery); off by default
         FASTEMBED_CACHE_PATH / LCM_LONGMEMEVAL_FASTEMBED_CACHE – model cache
         TIKTOKEN_CACHE_DIR  – populated tokenizer cache (set by the job)
     """
@@ -167,6 +183,7 @@ class LcmxClient:
         if not repo.is_dir():
             raise RuntimeError(f"LCMX_REPO does not exist: {repo}")
         _adapter_version()  # refuse a bad value before LCMX_DB_ROOT is created
+        _delivery_log_path()  # likewise a bad LCMX_DELIVERY_LOG
         self._db_root = Path(require_env("LCMX_DB_ROOT")).expanduser().resolve()
         self._db_root.mkdir(parents=True, exist_ok=True)
 
@@ -565,15 +582,43 @@ class LcmxClient:
         with _RECALL_LOCK, open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, default=str) + "\n")
 
+    def _log_delivery(self, path, user_id, query, version, lines, skipped):
+        """Opt-in delivery record (LCMX_DELIVERY_LOG): one JSONL line per search() call. ``lines`` follows the
+        returned text: {position, kind (message|summary|extra), store_id/node_id/session_id where the hit has
+        them, chars, and for summary hits source_store_ids from SummaryDAG.source_message_ids}; ``skipped``
+        holds dropped hits with a reason (empty_text, beyond_top_k). call_index counts this process's records
+        for the user from 0. No query or hit text is logged. One O_APPEND write per record."""
+        import hashlib
+
+        with _RECALL_LOCK, _user_lock(user_id):
+            index = _DELIVERY_CALLS.get(user_id, 0)
+            _DELIVERY_CALLS[user_id] = index + 1
+            record = {
+                "user_id": user_id,
+                "query_sha256": hashlib.sha256(str(query).encode("utf-8")).hexdigest(),
+                "call_index": index, "adapter_version": version,
+                "lines": [dict(entry, position=i) for i, entry in enumerate(lines)], "skipped": skipped,
+            }
+            data = (json.dumps(record, default=str) + "\n").encode("utf-8")
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                if os.write(fd, data) != len(data):
+                    raise OSError(f"LCMX_DELIVERY_LOG: short write to {path}")
+            finally:
+                os.close(fd)
+
     def search(self, query, user_id, top_k):
         """Run ``lcm_recall`` and return one ``[event_time] text`` line per hit
         (``[event_time] role: text`` with LCMX_ADAPTER_VERSION=2)."""
         _check_abort()
         version = _adapter_version()
+        log_path = _delivery_log_path()
         self._require_healthy_store(user_id)
         if not self._db_path(user_id).exists():
             if self._embeddings:
                 _abort("LCM-X semantic search store missing; ingest first", rebuild=True)
+            if log_path:
+                self._log_delivery(log_path, user_id, query, version, [], [])
             return ""
         import hermes_lcm.tools as lcm_tools
 
@@ -618,6 +663,10 @@ class LcmxClient:
                 ids = [h.get("store_id") for h in hits
                        if isinstance(h.get("store_id"), int)]
                 full_rows = store.get_batch(ids)
+            # LCMX_DELIVERY_LOG: summary lineage, read while the DAG is open (SELECT only); never truncated.
+            sources = {h["node_id"]: dag.source_message_ids(h["node_id"], limit=sys.maxsize)
+                       for h in hits[:top_k] + extras
+                       if h.get("kind") == "summary" and isinstance(h.get("node_id"), int)} if log_path else {}
         finally:
             vector_store.close()
             dag.close()
@@ -638,7 +687,14 @@ class LcmxClient:
             role = (hit.get("role") or (row or {}).get("role")) if version == 2 else None
             return text + (f"{role}: " if role else "")
 
-        lines = []
+        def entry(hit, extra=False, **fields):  # LCMX_DELIVERY_LOG only
+            summary = hit.get("kind") == "summary"
+            ids = {k: hit[k] for k in ("store_id", "node_id", "session_id") if hit.get(k) is not None}
+            if summary and hit.get("node_id") in sources:
+                ids["source_store_ids"] = sources[hit["node_id"]]
+            return dict({"kind": "extra" if extra else "summary" if summary else "message"}, **ids, **fields)
+
+        lines, logged, skipped = [], [], []
         for hit in hits[:top_k]:
             row = full_rows.get(hit.get("store_id")) if hit.get("kind") != "summary" else None
             if row and row.get("content"):
@@ -648,13 +704,24 @@ class LcmxClient:
                 snippet = str(hit.get("snippet") or "").replace(">>>", "").replace("<<<", "")
                 text = " ".join(snippet.split())
             if not text:
+                if log_path:
+                    skipped.append(entry(hit, reason="empty_text"))
                 continue
             lines.append(prefix(hit, row) + text)
+            if log_path:
+                logged.append(entry(hit, chars=len(lines[-1])))
         for hit in extras:  # bounded by lcm-x (at most N); not cut at top_k
             text = " ".join(str(hit.get("window") or "").split())
             if not text:
+                if log_path:
+                    skipped.append(entry(hit, True, reason="empty_text"))
                 continue
             lines.append(prefix(hit) + text)
+            if log_path:
+                logged.append(entry(hit, True, chars=len(lines[-1])))
+        if log_path:
+            skipped += [entry(h, reason="beyond_top_k") for h in hits[top_k:]]
+            self._log_delivery(log_path, user_id, query, version, logged, skipped)
         return "\n".join(lines)
 
     # -- delete ---------------------------------------------------------------
