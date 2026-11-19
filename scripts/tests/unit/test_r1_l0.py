@@ -345,3 +345,39 @@ def test_locomo_responses_answers_a_pending_question(tmp_path, monkeypatch):
     asyncio.run(locomo_responses.main("lcmx", "r1"))
     saved = json.loads((results / "lcmx_locomo_responses.json").read_text())
     assert saved == {"locomo_exp_user_0": [record]}
+
+
+def _declared_search(directory, mode):
+    directory.mkdir(parents=True, exist_ok=True)
+    search = directory / "lme_search_results.json"
+    search.write_text(json.dumps({"store": [dict(question_id="q", category="multi-session",
+                                                 search_context="[time] user: a fact",
+                                                 answer_evidences=["user : a fact"])]}), encoding="utf-8")
+    if mode is not None:
+        (directory / "lcmx_recall_status.json").write_text(json.dumps({"stage": "search", "summary_mode": mode}))
+    return search
+
+
+@pytest.mark.parametrize("mode, applies", [("deterministic_session_summary:1200", True),
+                                           ("condensed-llm", False), ("deterministic_session_summary:x", False),
+                                           (None, False)])
+def test_summary_coverage_stamp_follows_the_adapter_declaration(tmp_path, offline_cli, mode, applies):
+    search, prefix = _declared_search(tmp_path, mode), tmp_path / "report"
+    assert offline_cli(["score", str(search), "--arm", "A", "--output-prefix", str(prefix)]) == 0
+    report = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    markdown = prefix.with_suffix(".md").read_text(encoding="utf-8")
+    if applies:
+        assert report["summary_coverage"] == delivery.NOT_APPLICABLE.format("1200") and report["warning"] is None
+        assert delivery.WARNING not in markdown and "at most 1200 chars" in markdown
+    else:  # a condensed-summary arm, or no declaration, keeps the pending stamp and the never-gate warning
+        assert (report["summary_coverage"], report["warning"]) == ("pending-adapter-hook", delivery.WARNING)
+        assert delivery.WARNING in markdown
+
+
+@pytest.mark.parametrize("right, applies", [("deterministic_session_summary:1200", True), ("condensed-llm", False)])
+def test_pair_stamp_needs_both_sides_declared(tmp_path, offline_cli, capsys, right, applies):
+    left = _declared_search(tmp_path / "a", "deterministic_session_summary:1200")
+    assert offline_cli(["pair", str(left), str(_declared_search(tmp_path / "b", right))]) == 0
+    result = json.loads(capsys.readouterr().out)
+    expected = (delivery.NOT_APPLICABLE.format("1200"), None) if applies else ("pending-adapter-hook", delivery.WARNING)
+    assert (result["summary_coverage"], result["warning"]) == expected

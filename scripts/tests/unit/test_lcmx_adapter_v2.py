@@ -184,3 +184,26 @@ def test_init_refuses_bad_version_before_creating_db_root(monkeypatch, tmp_path)
     with pytest.raises(ValueError, match="LCMX_ADAPTER_VERSION"):
         lcmx_client.LcmxClient()
     assert not (tmp_path / "db").exists()
+
+
+def _verbatim_prefix(turns, *, max_chars=1200):
+    return ""
+
+
+def _condensed(turns):
+    return ""
+
+
+@pytest.mark.parametrize("summary,expected", [(_verbatim_prefix, "deterministic_session_summary:1200"),
+                                              (_condensed, None)])
+def test_summary_mode_recorded_only_for_verbatim_prefixes(monkeypatch, tmp_path, summary, expected):
+    _env(monkeypatch, "LCMX_ADAPTER_VERSION", None)
+    if summary is _verbatim_prefix:
+        summary.__name__ = "deterministic_session_summary"  # the name lcm-x's benchmarking module exports
+    c = lcmx_client.LcmxClient.__new__(lcmx_client.LcmxClient)
+    c.__dict__.update(_db_root=tmp_path, _embeddings=False, _summary=summary)
+    c._user_dir("u").mkdir()
+    c.set_search_results_dir(tmp_path / "results")
+    c._record_search_payload("u", {"hits": []})
+    status = json.loads((tmp_path / "results/lcmx_recall_status.json").read_text())
+    assert status.get("summary_mode") == expected

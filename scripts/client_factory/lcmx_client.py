@@ -55,6 +55,17 @@ def _adapter_version():
     return int(value)
 
 
+def _summary_mode(summary):
+    """'deterministic_session_summary:<max_chars>' when add() writes lcm-x's verbatim session prefixes, else None.
+    The L0 scorer reads it beside the search results to decide whether a separate summary class applies."""
+    import inspect
+
+    if getattr(summary, "__name__", "") != "deterministic_session_summary":
+        return None
+    default = inspect.signature(summary).parameters.get("max_chars")
+    return f"deterministic_session_summary:{default.default}" if default and type(default.default) is int else None
+
+
 def _delivery_log_path():
     # Read per call like _adapter_version; None when LCMX_DELIVERY_LOG is unset.
     raw = env_str("LCMX_DELIVERY_LOG", "") or ""
@@ -539,6 +550,9 @@ class LcmxClient:
         stage["payloads"] += 1
         stage["degraded_payloads"] += int(degraded)
         stage["adapter_version"] = _adapter_version()
+        mode = _summary_mode(getattr(self, "_summary", None))
+        if mode:
+            stage["summary_mode"] = mode
         atomic_json_dump(stage, path, indent=2)
         if degraded and self._embeddings:
             # Stage wrappers can turn Exception into a skipped question. This
