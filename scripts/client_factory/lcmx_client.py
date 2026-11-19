@@ -55,21 +55,38 @@ def _adapter_version():
 
 
 def _epoch_seconds(value):
-    """Epoch seconds by the store's observed_at rule (numeric, or timezone-aware ISO-8601), else None."""
+    """Epoch seconds exactly as LCM-X ``store._normalize_observed_at`` (store.py:201-235) reads
+    ``observed_at``, else None. A copy: importing hermes_lcm.store here breaks the fake test modules."""
     import math
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     if value is None or isinstance(value, bool):
         return None
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        try:
-            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-        except ValueError:
+    if isinstance(value, (int, float)):
+        observed_at = float(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
             return None
-        seconds = parsed.timestamp() if parsed.utcoffset() is not None else None
-    return seconds if seconds is not None and math.isfinite(seconds) and seconds > 0 else None
+        try:
+            observed_at = float(raw)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+            observed_at = parsed.timestamp()
+    else:
+        return None
+    if not math.isfinite(observed_at) or observed_at <= 0:
+        return None
+    try:
+        datetime.fromtimestamp(observed_at, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
+    return observed_at
 
 
 def _user_lock(user_id):
@@ -149,6 +166,7 @@ class LcmxClient:
         repo = Path(require_env("LCMX_REPO")).expanduser().resolve()
         if not repo.is_dir():
             raise RuntimeError(f"LCMX_REPO does not exist: {repo}")
+        _adapter_version()  # refuse a bad value before LCMX_DB_ROOT is created
         self._db_root = Path(require_env("LCMX_DB_ROOT")).expanduser().resolve()
         self._db_root.mkdir(parents=True, exist_ok=True)
 

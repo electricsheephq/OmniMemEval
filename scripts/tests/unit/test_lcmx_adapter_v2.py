@@ -148,3 +148,39 @@ def test_adapter_version_recorded_in_stage_report(monkeypatch, tmp_path, version
     c._record_search_payload("u", {"hits": []})
     assert json.loads((tmp_path / "results/lcmx_recall_status.json").read_text()) == {
         "stage": "search", "payloads": 1, "degraded_payloads": 0, "adapter_version": expected}
+
+
+def test_epoch_seconds_matches_store_normalize_observed_at():
+    # The L1 reviewer's 64-input differential (62 without numpy) against LCM-X store._normalize_observed_at (0ff64e73).
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    cases = [None, True, False, 0, 1, -1, 1683570600, 1683570600.5, "1683570600", " 1683570600 ", "\t1683570600\n",
+             "1683570600000", "1683570600000.0", 1683570600000, "-1683570600", "-0", "0", "0.0", "1e9", "1E9", "1e20",
+             1e20, "1_683_570_600", "+1683570600", "nan", "inf", "-inf", "Infinity", float("nan"), float("inf"), "",
+             " ", "\n", "2023-05-08T18:30:00Z", " 2023-05-08T18:30:00Z ", "2023-05-08T18:30:00+07:00",
+             "2023-05-08T18:30:00", "2023-05-08", "2023-05-08 18:30:00+00:00", "20230508T183000Z",
+             "2023-05-08T18:30:00z", "1:56 pm on 8 May, 2023", "1969-12-31T23:59:59Z", "1970-01-01T00:00:00Z",
+             "9999-12-31T23:59:59+00:00", "0001-01-01T00:00:00+00:00", "253402300799", "253402300800", 253402300800,
+             "1e15", b"1683570600", bytearray(b"5"), Decimal("1683570600"),
+             datetime(2023, 5, 8, 18, 30, tzinfo=timezone.utc), datetime(2023, 5, 8, 18, 30), [1], {"a": 1},
+             "١٦٨٣٥٧٠٦٠٠", "  ", "1683570600 Z", "0x10", "1.5e3"]
+    t = 1683570600.0
+    accepted = {4: 1.0, 6: t, 7: 1683570600.5, 8: t, 9: t, 10: t, 18: 1e9, 19: 1e9, 22: t, 23: t, 33: t, 34: t,
+                35: 1683545400.0, 38: t, 39: t, 44: 253402300799.0, 46: 253402300799.0, 57: t, 61: 1500.0}
+    try:
+        import numpy as np
+        cases += [np.int64(1683570600), np.float64(1683570600.0)]
+        accepted[63] = t
+    except ImportError:
+        pass
+    assert [lcmx_client._epoch_seconds(c) for c in cases] == [accepted.get(i) for i in range(len(cases))]
+
+
+def test_init_refuses_bad_version_before_creating_db_root(monkeypatch, tmp_path):
+    for name, value in (("LCMX_REPO", str(tmp_path)), ("LCMX_DB_ROOT", str(tmp_path / "db")),
+                        ("LCMX_ADAPTER_VERSION", "3")):
+        monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match="LCMX_ADAPTER_VERSION"):
+        lcmx_client.LcmxClient()
+    assert not (tmp_path / "db").exists()
