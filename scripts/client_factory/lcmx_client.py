@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,13 @@ from utils.checkpoint import atomic_json_dump
 from .base_client import env_int, env_str, require_env
 
 _DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# LCM-X's spellings of its OpenAI-compatible provider (config.py:860 at ae042245).
+_HOSTED_PROVIDERS = ("openai-compatible", "openai", "siliconflow")
+_HOSTED_RETRY_DELAYS_S = (1.0, 4.0)  # three attempts in all
+_HOSTED_RETRYABLE = re.compile(r"\((?:429|5\d\d)\)|network error|deadline exceeded|timed out")  # LCM-X error text
+_DOC_RERUN_DELAYS_S = (4.0, 16.0)  # failed document rows: at most two reruns of the product call
+_WITHHELD_CHUNKS = {}  # user_id -> chunks LCM-X's privacy transform withheld (persisted per store)
+_sleep = time.sleep
 
 # One warmed embedder per process (FastEmbed loads an ONNX model; ingestion
 # runs several client instances on worker threads).
@@ -145,6 +153,40 @@ class _LockedEmbedder:
             return self._provider.embed_query(text)
 
 
+def _retrying_transport(send):
+    """Resend one embeddings request on HTTP 429, 5xx or a network error, 1 s then 4 s apart. Any other
+    status returns at once; the last failure reaches the provider, which raises as it does without retry.
+    Retrying below the provider keeps its two-failure circuit breaker out of the attempts."""
+
+    def transport(**request):
+        for delay in _HOSTED_RETRY_DELAYS_S + (None,):
+            try:
+                response = send(**request)
+            except OSError:  # URLError and TimeoutError, the network errors the provider catches
+                if delay is None:
+                    raise
+            else:
+                if delay is None or response.status != 429 and not 500 <= response.status < 600:
+                    return response
+            _sleep(delay)
+
+    return transport
+
+
+def _hosted_embedder(model, base_url):
+    """Hosted query embedder (documents go through LCM-X's backfill): LCM-X's OpenAICompatibleProvider as
+    resolve_provider(for_backfill=True) builds it, 300 s timeout, retrying transport, one startup warmup. It reads
+    LCM_EMBEDDING_API_KEY per request. No config: GA has none; at ae042245 it adds only (empty) prefixes."""
+    from hermes_lcm import embedding_provider as ep
+
+    provider = ep.OpenAICompatibleProvider(
+        model, base_url=base_url, transport=_retrying_transport(ep._default_http_transport),
+        timeout=300.0, spend_guard=ep.EmbeddingSpendGuard(max_calls=0),
+    )
+    provider.embed_query("warmup")
+    return provider
+
+
 class LcmxClient:
     """LCM-X (hermes-lcm) in-process client for OmniMemEval.
 
@@ -166,6 +208,11 @@ class LcmxClient:
                                "off": full-text only
         LCMX_EMBED_PROVIDER  – embedding provider for fleet (default: fastembed)
         LCMX_EMBED_MODEL     – embedding model (default: BAAI/bge-small-en-v1.5)
+        LCMX_EMBED_BASE_URL  – openai-compatible only (required there): endpoint base URL;
+                               the key comes from LCM_EMBEDDING_API_KEY (required)
+        LCMX_EMBED_BATCH_SIZE – openai-compatible inputs per request (default: 10); LCMX_EMBED_CACHE is refused
+        LCMX_EMBED_CHUNK_PARITY – openai-compatible: "1" (default) also embeds chunks via LCM-X's opt-in chunk
+                               backfill; "0": summaries only, where LCM-X runs no automatic chunk backfill
         LCMX_EMBED_CACHE     – optional SQLite text->vector cache shared with the
                                LCM-X LongMemEval harness
         LCMX_SEARCH_SCOPE_BIAS – optional lcm_recall scope_bias override
@@ -190,6 +237,8 @@ class LcmxClient:
         TIKTOKEN_CACHE_DIR  – populated tokenizer cache (set by the job)
     """
 
+    _base_url = None  # set only on the hosted (openai-compatible) path
+
     def __init__(self):
         repo = Path(require_env("LCMX_REPO")).expanduser().resolve()
         if not repo.is_dir():
@@ -205,6 +254,18 @@ class LcmxClient:
         self._embeddings = mode == "fleet"
         self._provider_name = (env_str("LCMX_EMBED_PROVIDER", "fastembed") or "fastembed").lower()
         self._model = env_str("LCMX_EMBED_MODEL", _DEFAULT_FASTEMBED_MODEL)
+        if self._embeddings and self._provider_name in _HOSTED_PROVIDERS:
+            self._provider_name = "openai-compatible"  # one store identity for every spelling
+            self._model = require_env("LCMX_EMBED_MODEL")
+            self._base_url = require_env("LCMX_EMBED_BASE_URL")
+            require_env("LCM_EMBEDDING_API_KEY")  # presence only; the value is never read here
+            self._batch_size = env_int("LCMX_EMBED_BATCH_SIZE", 10, min_value=1)
+            self._chunk_parity = env_str("LCMX_EMBED_CHUNK_PARITY", "1") or "1"
+            if self._chunk_parity not in ("0", "1"):
+                raise ValueError(f"LCMX_EMBED_CHUNK_PARITY must be 0 or 1, got {self._chunk_parity!r}")
+            if env_str("LCMX_EMBED_CACHE"):
+                raise ValueError("LCMX_EMBED_CACHE is not supported with LCMX_EMBED_PROVIDER=openai-compatible: "
+                                 "LCM-X's own backfill embeds the documents and never reads that cache")
         self._scope_bias = env_str("LCMX_SEARCH_SCOPE_BIAS")
         self._top_k_cap = env_int("LCMX_TOPK_CAP", 25, min_value=1)
         self._delivery = (env_str("LCMX_DELIVERY", "full") or "full").lower()
@@ -235,7 +296,8 @@ class LcmxClient:
             with _EMBEDDER_LOCK:
                 if _EMBEDDER is None:
                     _EMBEDDER = _LockedEmbedder(
-                        resolve_harness_provider(self._provider_name, self._model)
+                        _hosted_embedder(self._model, self._base_url) if self._base_url
+                        else resolve_harness_provider(self._provider_name, self._model)
                     )
             self._embedder = _EMBEDDER
             self._dim = self._embedder.dim
@@ -277,6 +339,9 @@ class LcmxClient:
                 embedding_provider=self._provider_name,
                 embedding_model=self._model,
             )
+            if self._base_url:  # LCM-X's own providers read the same URL and request size
+                config.embedding_base_url = self._base_url
+                config.embedding_max_batch_items = self._batch_size
         # R2 flag arms: LCMX_CONFIG_SET="field=value,field=value" sets LCM-X config fields
         # (bool/int/float/str coerced from the field's default). Unknown fields abort.
         for item in filter(None, (env_str("LCMX_CONFIG_SET", "") or "").split(",")):
@@ -285,7 +350,8 @@ class LcmxClient:
             if not hasattr(config, name):
                 raise ValueError(f"LCMX_CONFIG_SET: unknown LCM-X config field {name!r}")
             default = getattr(config, name)
-            if isinstance(default, bool):
+            annotation = str(getattr(getattr(type(config), "__dataclass_fields__", {}).get(name), "type", ""))
+            if isinstance(default, bool) or default is None and "bool" in annotation:  # bool | None fields too
                 if raw.lower() not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
                     raise ValueError(f"LCMX_CONFIG_SET: {name} needs a boolean, got {raw!r}")
                 value = raw.lower() in ("1", "true", "yes", "on")
@@ -395,7 +461,7 @@ class LcmxClient:
                         or float(order),
                     )
                 )
-                if self._embeddings:
+                if self._embeddings and not self._base_url:  # hosted: LCM-X's backfill embeds in _catch_up
                     vector_store.register_profile(self._model, self._provider_name, self._dim)
                     identity = vector_store.capture_identity(
                         self._model, provider=self._provider_name
@@ -472,6 +538,16 @@ class LcmxClient:
 
         path = self._user_dir(user_id) / "embedding_catchup.json"
         report = {"status": "not_applicable", "passes": 0}
+        if self._base_url:  # own try: the shared one below would change the default path's error handling
+            try:
+                self._hosted_register(user_id, config)
+                if not hasattr(lcm_tools, "_lcm_recall_catchup_reason"):
+                    _abort("LCM-X hosted embeddings need a tree with catch-up receipts (no_receipt_gate)", rebuild=True)
+                from hermes_lcm.embedding_provider import _automatic_chunks_allowed
+
+                chunks_allowed = _automatic_chunks_allowed(config)
+            except Exception as exc:  # noqa: BLE001 - the same clean abort as the catch-up
+                _abort(f"LCM-X embedding catch-up failed: {type(exc).__name__}", rebuild=True)
         if not hasattr(lcm_tools, "_lcm_recall_catchup_reason") or not self._embeddings:
             report["reason"] = "no_receipt_gate" if self._embeddings else "embeddings_disabled"
             atomic_json_dump(report, path, indent=2)
@@ -483,6 +559,12 @@ class LcmxClient:
         limit = env_int("LCMX_CATCHUP_MAX_PASSES", 500, min_value=1)
         db = str(self._db_path(user_id))
         idle, count, retry_deadline = 0, 0, None
+        parity = summaries_only = False
+        if self._base_url:
+            parity = self._chunk_parity == "1"
+            # Summaries only with parity off, and only where LCM-X itself runs no automatic chunk backfill.
+            summaries_only = not parity and not chunks_allowed
+        done, part = ("", "") if summaries_only else (r" chunks=complete:\d+", r" chunks=(?:complete|partial):\d+")
 
         def progress_state(receipts):
             return ({k: {f: v for f, v in r.items() if f != "updated_at"}
@@ -503,9 +585,16 @@ class LcmxClient:
                     continue
                 count += 1
                 retry_deadline = None
+                if self._base_url:
+                    outcome = self._hosted_summary_rerun(user_id, db, config, outcome)
+                if parity:  # LCM-X's operator opt-in for cloud chunk embedding, recorded in the report
+                    outcome = f"{outcome} chunks={self._hosted_chunk_pass(user_id, db, config, report)}"
+                    report.update(outcome=outcome, chunk_backfill="confirm_raw_text")
                 receipts = self._catchup_receipts(user_id)
+                if summaries_only:
+                    receipts.pop("chunk")
                 report["receipts"] = receipts
-                complete = re.fullmatch(r"summaries=complete:\d+ chunks=complete:\d+", str(outcome))
+                complete = re.fullmatch(r"summaries=complete:\d+" + done, str(outcome))
                 if complete and all(r.get("remaining") == 0 and not r.get("operator_retry") for r in receipts.values()):
                     report["status"] = "complete"
                     return
@@ -517,13 +606,79 @@ class LcmxClient:
                     _abort("LCM-X catch-up stalled for 20 passes", rebuild=True)
                 # The pass does not raise on failures. Reject refusals and errors;
                 # only bounded partial/complete work may need another pass.
-                if not re.fullmatch(r"summaries=(?:complete|partial):\d+ chunks=(?:complete|partial):\d+", str(outcome)):
+                if not re.fullmatch(r"summaries=(?:complete|partial):\d+" + part, str(outcome)):
                     _abort(f"LCM-X embedding catch-up failed: {outcome}", rebuild=True)
             _abort(f"LCM-X embedding catch-up incomplete after {limit} passes", rebuild=True)
         except Exception as exc:  # noqa: BLE001 - make maintenance failures fatal
             _abort(f"LCM-X embedding catch-up failed: {type(exc).__name__}", rebuild=True)
         finally:
             atomic_json_dump(report, path, indent=2)
+
+    def _hosted_register(self, user_id, config):
+        """Summary and chunk profiles (identity, cloud privacy revision) from LCM-X's `/lcm embed warmup` core, once
+        per store; retried like the transport (3 attempts, 1 s, 4 s), on LCM-X's 429/5xx/network/timeout text only."""
+        from hermes_lcm import command
+
+        db = str(self._db_path(user_id))
+        with closing(command._embedding_read_connection(db)) as conn:
+            registered = None not in (command._embedding_current_profile(conn), command._chunk_current_profile(conn))
+        for delay in () if registered else _HOSTED_RETRY_DELAYS_S + (None,):
+            result = command._embedding_register_profiles(config, db, allow_download=False)
+            if not isinstance(result, str):
+                return
+            if delay is None or not _HOSTED_RETRYABLE.search(result.splitlines()[-1]):
+                _abort(f"LCM-X embedding warmup failed: {result.splitlines()[-1]}", rebuild=True)
+            _sleep(delay)
+
+    def _hosted_summary_rerun(self, user_id, db, config, outcome):
+        """Failed summary rows (receipt operator_retry) survive a plain pass on a cloud provider: rerun LCM-X's
+        `/lcm embed backfill --apply --retry-uncertain` core at most twice, 4 s then 16 s apart."""
+        from hermes_lcm import command
+
+        reran, embedded = False, 0
+        for delay in _DOC_RERUN_DELAYS_S + (None,):
+            if not self._catchup_receipts(user_id)["summary"].get("operator_retry"):
+                return f"summaries=partial:{embedded}" if reran else outcome
+            if delay is None:
+                return "summaries=failed_rows_remain"
+            _sleep(delay)
+            result = command._embedding_backfill_summary_run(config, db, apply=True, limit=self._batch_size,
+                                                             retry_uncertain=True)
+            if isinstance(result, str) or result.get("error"):
+                return "summaries=error"
+            reran, embedded = True, embedded + int(result.get("embedded") or 0)
+
+    def _hosted_chunk_pass(self, user_id, db, config, report):
+        """Parity: one `/lcm embed backfill --corpus chunks --apply --confirm-raw-text` pass, rerun with
+        retry_uncertain at most twice (4 s, 16 s) while rows fail. Returns complete:N, partial:N, or error."""
+        from hermes_lcm import command
+
+        embedded = withheld = 0
+        for delay in (0.0,) + _DOC_RERUN_DELAYS_S:
+            if delay:
+                _sleep(delay)
+            result = command._chunk_backfill_run(config, db, apply=True, limit=self._batch_size, policy=self._chunk_policy,
+                                                 retry_uncertain=delay > 0, confirm_raw_text=True, incremental=True)
+            if isinstance(result, str):
+                break
+            embedded += int(result.get("embedded") or 0)
+            withheld += int(result.get("privacy_withheld") or 0)
+            if not result.get("failed"):
+                break
+        path = self._user_dir(user_id) / "withheld_chunks.json"  # LCM-X's privacy default: counted, never an abort
+        count = _WITHHELD_CHUNKS[user_id] = withheld + (json.loads(path.read_text()) if path.exists() else 0)
+        atomic_json_dump(count, path)
+        report.update(privacy_withheld_store=count, privacy_withheld_total=sum(_WITHHELD_CHUNKS.values()))
+        if count and "withheld" not in _CONFIG_SET_LOGGED:
+            _CONFIG_SET_LOGGED.add("withheld")
+            print(f"[lcmx] WARNING: LCM-X's privacy transform withheld {count} chunk(s) in store {_safe(user_id)}; "
+                  "per-store and total counts in embedding_catchup.json", file=sys.stderr)
+        if isinstance(result, str) or result.get("error") or result.get("failed") \
+                or result.get("stop_reason") not in (None, "op_budget_exhausted"):
+            report["chunk_error"] = result if isinstance(result, str) else {
+                k: result.get(k) for k in ("error", "failed", "stop_reason")}
+            return "error"
+        return f"{'partial' if result.get('remaining') else 'complete'}:{embedded}"
 
     def set_search_results_dir(self, path):
         self._search_status_path = Path(path) / "lcmx_recall_status.json"
