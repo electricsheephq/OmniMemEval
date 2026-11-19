@@ -1,5 +1,5 @@
-"""Hosted (openai-compatible) embedder: wiring, retry, product-owned identity and chunk parity, catch-up gate,
-cache refusal, typed config, plus a golden for the default fastembed path.
+"""Hosted (openai-compatible) embedder: wiring, retry, product-owned identity with the privacy filter off, chunk
+parity, catch-up gate, startup refusals, typed config, plus a golden for the default fastembed path.
 
 Real-tree tests use LCM-X (needs LCMX_REPO) with a fake HTTP transport: no network, a fake key. Trees with the
 catch-up receipt gate (ae042245) run ingest and recall end to end; trees without it (v0.28.0 GA) must refuse
@@ -32,8 +32,8 @@ MODEL = "text-embedding-v4"
 def fresh_state(monkeypatch, tmp_path):
     monkeypatch.setattr(lcmx_client, "_ABORT", threading.Event())
     monkeypatch.setattr(lcmx_client, "_ABORT_MESSAGE", None)
-    monkeypatch.setattr(lcmx_client, "_EMBEDDER", None)
-    monkeypatch.setattr(lcmx_client, "_WITHHELD_CHUNKS", {}, raising=False)
+    monkeypatch.setattr(lcmx_client, "_EMBEDDER", None, raising=False)  # the pre-round-4 single cache
+    monkeypatch.setattr(lcmx_client, "_EMBEDDERS", {}, raising=False)
     monkeypatch.setattr(lcmx_client, "_CONFIG_SET_LOGGED", set())
     for name in ("LCMX_CONFIG", "LCMX_CONFIG_SET", "LCMX_EMBED_CACHE", "LCMX_ADAPTER_VERSION", "LCMX_DELIVERY_LOG",
                  "LCMX_EMBED_PROVIDER", "LCMX_EMBED_MODEL", "LCMX_EMBED_BASE_URL", "LCMX_EMBED_BATCH_SIZE",
@@ -66,15 +66,34 @@ def test_hosted_startup_refuses_missing_url_or_key_without_key_text(monkeypatch,
     assert FAKE_KEY not in str(exc.value) + out.out + out.err
 
 
-@pytest.mark.parametrize("extra,match", [({"LCMX_EMBED_CACHE": "/x/cache.sqlite"}, "LCMX_EMBED_CACHE is not supported"),
-                                         ({"LCMX_EMBED_CHUNK_PARITY": "yes"}, "LCMX_EMBED_CHUNK_PARITY must be 0 or 1")])
-def test_hosted_startup_refuses_embed_cache_and_bad_parity(monkeypatch, tmp_path, capsys, extra, match):
+@pytest.mark.parametrize("extra,match", [
+    ({"LCMX_EMBED_CACHE": "/x/cache.sqlite"}, "LCMX_EMBED_CACHE is not supported"),
+    ({"LCMX_CHUNK_POLICY": "full"}, "LCMX_CHUNK_POLICY=full is not supported"),  # A9
+    ({"LCMX_CONFIG_SET": "embedding_storage_dtype=int8"}, "embedding_storage_dtype"),  # A2
+    ({"LCMX_CONFIG_SET": "recall_extra_entries=2,embedding_query_prefix=q: "}, "embedding_query_prefix"),
+    ({"LCMX_CONFIG_SET": "embedding_document_prefix=d: "}, "embedding_document_prefix"),
+    ({"LCMX_CONFIG_SET": "embedding_privacy_enabled=true"}, "embedding_privacy_enabled"),
+])
+def test_hosted_startup_refusals(monkeypatch, tmp_path, capsys, extra, match):
     monkeypatch.setenv("LCMX_REPO", str(tmp_path))
     _hosted_env(monkeypatch, **extra)
     with pytest.raises(ValueError, match=match) as exc:
         lcmx_client.LcmxClient()
     out = capsys.readouterr()
     assert FAKE_KEY not in str(exc.value) + out.out + out.err
+
+
+@pytest.mark.parametrize("key", [FAKE_KEY + "\nX-Leak: 1", "sk fake", "\tsk-fake", "sk-fake\x1b[0m", "sk-fake\x7f",
+                                 "sk-fake\u2028x", FAKE_KEY + "\n"])
+def test_hosted_startup_refuses_key_with_whitespace_or_control_chars_without_echoing_it(monkeypatch, tmp_path, capsys,
+                                                                                        key):
+    """A7: a key with an interior newline would put a forged header line into the request."""
+    monkeypatch.setenv("LCMX_REPO", str(tmp_path))
+    _hosted_env(monkeypatch, LCM_EMBEDDING_API_KEY=key)
+    with pytest.raises(ValueError, match="LCM_EMBEDDING_API_KEY contains whitespace or a control character") as exc:
+        lcmx_client.LcmxClient()
+    out = capsys.readouterr()
+    assert "sk" not in str(exc.value).replace("LCM_EMBEDDING_API_KEY", "") + out.out + out.err
 
 
 # -- typed config (point 4) -----------------------------------------------------------------------------------
@@ -164,8 +183,10 @@ def test_hosted_wiring_model_url_key_reach_provider_and_identity(monkeypatch, ht
         "openai-compatible", MODEL, URL)
     assert type(config.embedding_max_batch_items) is int and config.embedding_max_batch_items == 10
     assert probe_provider_availability(config)["available"] is True
-    monkeypatch.setenv("LCMX_CONFIG_SET", "embedding_privacy_enabled=false")
-    assert c._config("u").embedding_privacy_enabled is False  # LCM-X's `bool | None = None` field, typed
+    assert config.embedding_privacy_enabled is False  # owner: privacy filter off on the hosted path (typed bool)
+    from hermes_lcm.ingest_policy import embedding_privacy_revision
+
+    assert embedding_privacy_revision(config) == "privacy:off"
 
 
 @needs_repo
@@ -251,11 +272,12 @@ def test_hosted_ingest_and_recall_use_product_identity_and_chunk_parity(monkeypa
     assert not isinstance(command._embedding_register_profiles(c._config("u"), str(fresh), allow_download=False), str)
     stored = _profiles(c._db_path("u"))
     assert stored == _profiles(fresh) and {row[0] for row in stored} == {"summary", "chunk"}
-    assert all(row[3].startswith("privacy:") for row in stored)  # the product's cloud privacy revision
+    assert {row[3] for row in stored} == {"privacy:off"}  # the product's own label for the filter off
     if not gate:
         return
     report = json.loads((c._user_dir("u") / "embedding_catchup.json").read_text())
     assert report["status"] == "complete" and report["chunk_backfill"] == "confirm_raw_text"
+    assert report["ingest_rewritten_rows_store"] == 0  # nothing externalized or rewritten in these sessions
     expected = []
     for session in (SESSION, SESSION2):
         rows = [{"store_id": i + 1, "role": m["role"], "content": m["content"]} for i, m in enumerate(session)]
@@ -291,6 +313,67 @@ def test_hosted_one_429_in_ingest_recovers_end_to_end(monkeypatch, http, script,
     assert "Biscuit" in c.search("what is my dog's name", "u", 5)
 
 
+F1_BLOB = __import__("base64").b64encode(__import__("hashlib").sha512(b"verify-1").digest() * 3).decode()
+F1_TEXT = ("Session 0: my sister Ana moved to Lisbon and works at a bakery near the river.\nHere is the config blob you "
+           "asked for:\n" + F1_BLOB[:64] + "\n" + F1_BLOB[64:128] + "\nthanks")
+
+
+@needs_repo
+def test_reviewer_f1_base64_probe_embeds_with_the_filter_off(monkeypatch, http):
+    """Item 1: the reviewers' two 64-character base64 lines embed verbatim and catch-up completes. Item 3: the
+    retired LCMX_EMBED_CHUNK_PARITY=0 no longer turns chunks off."""
+    _hosted_env(monkeypatch, LCMX_EMBED_CHUNK_PARITY="0")
+    c = lcmx_client.LcmxClient()
+    import hermes_lcm.tools as tools
+
+    if not hasattr(tools, "_lcm_recall_catchup_reason"):
+        pytest.skip("tree without the catch-up receipt gate refuses the hosted path")
+    http.requests.clear()
+    c.add([{"role": "user", "content": F1_TEXT, "chat_time": "2023-05-01T09:00:00Z"},
+           {"role": "assistant", "content": "Noted.", "chat_time": "2023-05-01T09:01:00Z"}], "u1", session_id="s0")
+    report = json.loads((c._user_dir("u1") / "embedding_catchup.json").read_text())
+    assert report["status"] == "complete" and report["outcome"] == "summaries=complete:1 chunks=complete:2"
+    sent = " ".join(t for r in http.requests for t in r["payload"]["input"])
+    assert F1_BLOB[:64] in sent and F1_BLOB[64:128] in sent
+
+
+@needs_repo
+def test_a_large_externalized_turn_is_counted_and_warned(monkeypatch, http, capsys):
+    """A3: LCM-X externalizes a very large turn; hosted backfill then embeds the stored placeholder, not the
+    original windows the local arm embeds. The adapter counts such rows per store and warns once."""
+    _hosted_env(monkeypatch)
+    c = lcmx_client.LcmxClient()
+    import hermes_lcm.tools as tools
+
+    if not hasattr(tools, "_lcm_recall_catchup_reason"):
+        pytest.skip("tree without the catch-up receipt gate refuses the hosted path")
+    big = " ".join(f"Line {i}: Ana described the bakery recipe step {i} with flour and a slow proof." for i in range(1500))
+    for sid in ("s1", "s2"):
+        c.add([{"role": "user", "content": big, "chat_time": "2023-05-02T09:00:00Z"},
+               {"role": "assistant", "content": "Noted, thanks.", "chat_time": "2023-05-02T09:01:00Z"}], "u", session_id=sid)
+    report = json.loads((c._user_dir("u") / "embedding_catchup.json").read_text())
+    assert report["status"] == "complete" and report["ingest_rewritten_rows_store"] == 2
+    assert capsys.readouterr().err.count("WARNING") == 1
+
+
+@needs_repo
+def test_a_default_client_never_reuses_a_cached_hosted_provider(monkeypatch, http):
+    """A1: hosted then default in one process; the default client gets its own provider."""
+    _hosted_env(monkeypatch)
+    hosted = lcmx_client.LcmxClient()
+    import benchmarking.longmemeval as lme
+
+    fake = FakeProvider()
+    monkeypatch.setattr(lme, "resolve_harness_provider", lambda *a, **k: fake)
+    for name in ("LCMX_EMBED_PROVIDER", "LCMX_EMBED_MODEL", "LCMX_EMBED_BASE_URL"):
+        monkeypatch.delenv(name)
+    default = lcmx_client.LcmxClient()
+    assert default._embedder._provider is fake and hosted._embedder._provider is not fake
+    assert (default._provider_name, default._base_url) == ("fastembed", None)
+    _hosted_env(monkeypatch)
+    assert lcmx_client.LcmxClient()._embedder is hosted._embedder  # same (provider, model, base_url): shared
+
+
 # -- catch-up gate with fake LCM-X modules (point 2) -----------------------------------------------------------
 
 @pytest.fixture
@@ -298,7 +381,7 @@ def gate(tmp_path, monkeypatch):
     """A hosted client whose catch-up runs against faked LCM-X maintenance, command and provider modules."""
     c = lcmx_client.LcmxClient.__new__(lcmx_client.LcmxClient)
     c.__dict__.update(_db_root=tmp_path, _embeddings=True, _provider_name="openai-compatible", _model=MODEL,
-                      _embedder=SimpleNamespace(model_id=MODEL), _base_url=URL, _chunk_parity="1",
+                      _embedder=SimpleNamespace(model_id=MODEL), _base_url=URL,
                       _chunk_policy="conversational", _batch_size=10)
     c._user_dir("u").mkdir()
     mods = {name: ModuleType(name) for name in ("hermes_lcm", "hermes_lcm.tools", "hermes_lcm.command",
@@ -402,29 +485,25 @@ def test_parity_refuses_a_summaries_only_catch_up(gate):
         gate.client._catch_up("u", SimpleNamespace(embedding_max_batch_items=10))
 
 
-def test_parity_off_accepts_summaries_only_only_where_product_runs_no_chunk_backfill(gate):
-    gate.client._chunk_parity = "0"
-    _drop_chunk_receipt(gate.client)
-    gate.client._catch_up("u", SimpleNamespace(embedding_max_batch_items=10))
+def test_hosted_always_requires_chunks_whatever_the_old_parity_switch_says(gate, monkeypatch):
+    """F5: no LCMX_EMBED_CHUNK_PARITY any more; the hosted path always embeds chunks and requires them complete."""
+    monkeypatch.setenv("LCMX_EMBED_CHUNK_PARITY", "0")
+    gate.client._catch_up("u", CONFIG)
     assert _report(gate.client)["status"] == "complete"
-    gate.command._chunk_backfill_run.assert_not_called()
-    gate.chunks_allowed.return_value = True  # the product would embed chunks here: summaries-only aborts
-    with pytest.raises(SystemExit, match="catch-up failed: summaries=complete:0"):
-        gate.client._catch_up("u", SimpleNamespace(embedding_max_batch_items=10))
+    gate.command._chunk_backfill_run.assert_called_once()
+    _drop_chunk_receipt(gate.client)
+    with pytest.raises(SystemExit, match="incomplete after 3"):
+        gate.client._catch_up("u", CONFIG)
 
 
-@pytest.mark.parametrize("parity", ["0", "1"])
 @pytest.mark.parametrize("outcome", ["summaries=error", "error", "model_unavailable", "summaries=error chunks=complete:0"])
-def test_hosted_error_parts_still_abort(gate, parity, outcome):
-    gate.client._chunk_parity = parity
+def test_hosted_error_parts_still_abort(gate, outcome):
     gate.maintenance.run_incremental_embedding_pass.return_value = outcome
     with pytest.raises(SystemExit, match="catch-up failed"):
         gate.client._catch_up("u", SimpleNamespace(embedding_max_batch_items=10))
 
 
-@pytest.mark.parametrize("parity", ["0", "1"])
-def test_hosted_incomplete_summaries_never_complete(gate, parity):
-    gate.client._chunk_parity = parity
+def test_hosted_incomplete_summaries_never_complete(gate):
     gate.maintenance.run_incremental_embedding_pass.return_value = "summaries=partial:0"
     with pytest.raises(SystemExit, match="stalled|incomplete"):
         gate.client._catch_up("u", SimpleNamespace(embedding_max_batch_items=10))
@@ -511,15 +590,37 @@ def test_registration_failure_ends_in_a_clean_abort(gate):
     assert lcmx_client._ABORT.is_set()
 
 
-def test_withheld_chunks_are_counted_recorded_and_warned_once_not_aborted(gate, capsys):
-    gate.command._chunk_backfill_run.return_value = dict(OK, embedded=2, privacy_withheld=2)
-    gate.client._catch_up("u", CONFIG)
-    gate.client._catch_up("u", CONFIG)  # a second session in the same store
-    report = _report(gate.client)
-    assert report["status"] == "complete"
-    assert (report["privacy_withheld_store"], report["privacy_withheld_total"]) == (4, 4)
-    assert json.loads((gate.client._user_dir("u") / "withheld_chunks.json").read_text()) == 4
-    assert capsys.readouterr().err.count("WARNING") == 1
+def test_a_withheld_chunk_is_an_unembedded_chunk_and_aborts(gate):
+    """Filter off: nothing should be withheld; if LCM-X still reports one, parity fails. No withheld sidecar."""
+    gate.command._chunk_backfill_run.return_value = dict(OK, embedded=2, privacy_withheld=1)
+    with pytest.raises(SystemExit, match="chunks=error"):
+        gate.client._catch_up("u", CONFIG)
+    assert not (gate.client._user_dir("u") / "withheld_chunks.json").exists()
+
+
+# -- round 4: error parts survive reruns (A4) ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("first", ["summaries=error", "summaries=refused", "summaries=partial:0 error"])
+def test_a_summary_error_part_is_not_erased_by_a_clean_rerun(gate, first):
+    seed(gate.client, summary_retry=1)
+    passes = iter([first, "summaries=complete:0"])
+    gate.maintenance.run_incremental_embedding_pass.side_effect = lambda db, config: next(passes)
+
+    def rerun(config, db, **kwargs):
+        seed(gate.client)
+        return dict(OK, embedded=1)
+
+    gate.command._embedding_backfill_summary_run.side_effect = rerun
+    with pytest.raises(SystemExit, match="catch-up failed"):
+        gate.client._catch_up("u", CONFIG)
+
+
+@pytest.mark.parametrize("first", [{"error": "provider authentication failed; 401"},
+                                   {"stop_reason": "lease_lost"}, {"stop_reason": "privacy_refused", "error": "x"}])
+def test_a_chunk_error_is_not_erased_by_a_clean_rerun(gate, first):
+    gate.command._chunk_backfill_run.side_effect = [dict(FAILED, **first), dict(OK, embedded=2)]
+    with pytest.raises(SystemExit, match="chunks=error"):
+        gate.client._catch_up("u", CONFIG)
 
 
 # -- default path golden (fake LCM-X modules) ----------------------------------------------------------------
