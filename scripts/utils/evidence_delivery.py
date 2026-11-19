@@ -1,6 +1,8 @@
 """Offline evidence delivery for saved LongMemEval, LoCoMo and PMv2 searches."""
 import json
+from argparse import ArgumentParser
 from itertools import chain, zip_longest
+from pathlib import Path
 
 BUDGETS = (4096, 8192, 16384)
 WARNING = ("Verbatim-only undercounts evidence carried by summaries and must not gate "
@@ -52,6 +54,8 @@ def score(data, encoding):
             context = ""
         hits = row.get("delivered_hits", [])
         sources = row.get("evidence_source_store_ids", [None] * len(turns))
+        # LME gold sessions are extracted in set order, which can vary between runs.
+        turns, sources = zip(*sorted(zip(turns, sources, strict=True), key=lambda item: item[0]))
         rows[qid] = (str(row["category"]), dict(classes(turns, context, hits, sources, encoding)),
                      hits or context.splitlines())
     return rows
@@ -62,3 +66,69 @@ def pair(a, b):
         left, right = a.get(qid, (None, {}, [])), b.get(qid, (None, {}, []))
         if left[:2] != right[:2]:
             yield qid, next((hits for hits in zip_longest(left[2], right[2]) if hits[0] != hits[1]), None)
+
+
+def aggregates(rows):
+    groups = {None: []}
+    for category, scores, _ in rows.values():
+        groups[None].append(scores)
+        groups.setdefault(category, []).append(scores)
+    for category in sorted(groups, key=lambda name: (name is not None, name)):
+        questions = groups[category]
+        for budget in BUDGETS:
+            for mode in ("strict", "lenient"):
+                labels = [scores[budget, mode] for scores in questions]
+                items = sum(map(len, labels))
+                result = dict(category=category, budget_tokens=budget, mode=mode,
+                              questions=len(questions), evidence_items=items)
+                for name, delivered in (("verbatim", ("verbatim",)),
+                                        ("verbatim_plus_summary", ("verbatim", "summary"))):
+                    hits = [sum(label in delivered for label in question) for question in labels]
+                    result[name] = dict(evidence_recall=sum(hits) / items if items else None,
+                                        all_evidence_delivered=sum(n == len(q) for n, q in zip(hits, labels))
+                                        / len(questions) if questions else None)
+                yield result
+
+
+def write_reports(prefix, rows, arm):
+    results = list(aggregates(rows))
+    report = dict(arm=arm, summary_coverage="pending-adapter-hook", warning=WARNING, results=results)
+    Path(f"{prefix}.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    lines = [f"# Evidence delivery ({arm})", "", f"> **Warning:** {WARNING} (`summary_coverage: pending-adapter-hook`)", "",
+             "| Category | Tokens | Match | Questions | Items | Verbatim recall | Verbatim all | V+S recall | V+S all |",
+             "|---|---:|---|---:|---:|---:|---:|---:|---:|"]
+    for row in results:
+        rates = [rate for key in ("verbatim", "verbatim_plus_summary") for rate in row[key].values()]
+        cells = [row["category"] if row["category"] is not None else "**Overall**", row["budget_tokens"],
+                 row["mode"], row["questions"], row["evidence_items"]]
+        cells += [f"{rate:.2%}" if rate is not None else "—" for rate in rates]
+        lines.append("| " + " | ".join(map(str, cells)) + " |")
+    Path(f"{prefix}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main(argv=None):
+    parser = ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    scorer = commands.add_parser("score", help="write JSON and Markdown evidence reports")
+    scorer.add_argument("search", type=Path)
+    scorer.add_argument("--arm", required=True)
+    scorer.add_argument("--output-prefix", required=True, type=Path)
+    pairing = commands.add_parser("pair", help="compare A and A' by question ID")
+    pairing.add_argument("search", type=Path)
+    pairing.add_argument("replica", type=Path)
+    args = parser.parse_args(argv)
+    from utils.nlp_metrics import get_encoding
+    encoding = get_encoding()
+    rows = score(json.loads(args.search.read_text(encoding="utf-8")), encoding)
+    if args.command == "score":
+        write_reports(args.output_prefix, rows, args.arm)
+        return 0
+    replica = score(json.loads(args.replica.read_text(encoding="utf-8")), encoding)
+    discordant = dict(pair(rows, replica))
+    print(json.dumps(dict(summary_coverage="pending-adapter-hook", warning=WARNING,
+                          discordant_questions=len(discordant), first_differing_hits=discordant), indent=2))
+    return int(bool(discordant))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -3,7 +3,9 @@
 import hashlib
 import json
 import random
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, mock_open
 
 import pandas as pd
@@ -141,6 +143,69 @@ def test_pairing_uses_question_id_and_identifies_changed_delivery(encoding):
     broken = scored_lme(encoding, "[time] unrelated")
     assert dict(delivery.pair(left, replica)) == {}
     assert dict(delivery.pair(left, broken)) == {"q-7": ("[time] a fact", "[time] unrelated")}
+
+
+def test_pairing_ignores_lme_gold_session_order(encoding):
+    left = scored_lme(encoding, "a fact", ("a fact", "other fact"))
+    replica = scored_lme(encoding, "a fact", ("other fact", "a fact"))
+    assert dict(delivery.pair(left, replica)) == {}
+
+
+@pytest.fixture
+def offline_cli(monkeypatch, encoding):
+    # Stop at the tokenizer boundary so this exercises saved files without a vocabulary download.
+    monkeypatch.setitem(sys.modules, "utils.nlp_metrics", SimpleNamespace(get_encoding=lambda: encoding))
+    return delivery.main
+
+
+def test_score_cli_reports_overall_and_each_category(tmp_path, offline_cli):
+    search = tmp_path / "lme_search_results.json"
+    search.write_text(json.dumps({"store": [
+        dict(question_id="one", category="multi-session", search_context="[time] first\nsummary",
+             answer_evidences=["user : first", "user : second"],
+             evidence_source_store_ids=["raw-1", "raw-2"],
+             delivered_hits=[dict(position=1, kind="summary", store_id="summary-2",
+                                  node_id="node-2", source_store_ids=["raw-2"])]),
+        dict(question_id="two", category="temporal", search_context="",
+             answer_evidences=["user : missing"]),
+    ]}), encoding="utf-8")
+    prefix = tmp_path / "report"
+    assert offline_cli(["score", str(search), "--arm", "A", "--output-prefix", str(prefix)]) == 0
+    report = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    assert report["arm"] == "A"
+    assert report["summary_coverage"] == "pending-adapter-hook"
+    assert report["warning"] == delivery.WARNING
+    results = {(row["category"], row["budget_tokens"], row["mode"]): row for row in report["results"]}
+    assert set(results) == {(category, budget, mode) for category in (None, "multi-session", "temporal")
+                            for budget in delivery.BUDGETS for mode in ("strict", "lenient")}
+    overall = results[None, 4096, "strict"]
+    assert (overall["questions"], overall["evidence_items"]) == (2, 3)
+    assert overall["verbatim"] == dict(evidence_recall=1 / 3, all_evidence_delivered=0)
+    assert overall["verbatim_plus_summary"] == dict(evidence_recall=2 / 3, all_evidence_delivered=0.5)
+    assert results["multi-session", 4096, "strict"]["verbatim"] == dict(
+        evidence_recall=0.5, all_evidence_delivered=0)
+    assert results["temporal", 16384, "lenient"]["verbatim"]["evidence_recall"] == 0
+    markdown = prefix.with_suffix(".md").read_text(encoding="utf-8")
+    assert delivery.WARNING in markdown and "pending-adapter-hook" in markdown
+    assert "| **Overall** | 4096 | strict | 2 | 3 | 33.33% | 0.00% | 66.67% | 50.00% |" in markdown
+
+
+@pytest.mark.parametrize("replica_hit", ["second", "unrelated", None])
+def test_pair_cli_reports_first_differing_hit(tmp_path, offline_cli, capsys, replica_hit):
+    def save(path, store, hit):
+        rows = [] if hit is None else [dict(question_id="q1", category="multi-session",
+                                            search_context=f"first\n{hit}",
+                                            answer_evidences=["user : second"])]
+        path.write_text(json.dumps({store: rows}), encoding="utf-8")
+
+    left, right = tmp_path / "a.json", tmp_path / "replica.json"
+    save(left, "A-store", "second")
+    save(right, "replica-store", replica_hit)
+    assert offline_cli(["pair", str(left), str(right)]) == int(replica_hit != "second")
+    result = json.loads(capsys.readouterr().out)
+    assert result["discordant_questions"] == int(replica_hit != "second")
+    expected = {"second": {}, "unrelated": {"q1": ["second", "unrelated"]}, None: {"q1": ["first", None]}}
+    assert result["first_differing_hits"] == expected[replica_hit]
 
 
 def test_same_store_version_refused_before_cache_lookup(monkeypatch):
