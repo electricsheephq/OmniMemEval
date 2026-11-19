@@ -1,6 +1,6 @@
 """Read-only proof for LCMX_DELIVERY_LOG on a real synthetic LCM-X store (needs LCMX_REPO).
 
-Imports the real hermes_lcm into sys.modules, so run this file in its own pytest process.
+Imports the real hermes_lcm; the fake-module tests patch sys.modules per test, so a combined run also passes.
 """
 import hashlib
 import json

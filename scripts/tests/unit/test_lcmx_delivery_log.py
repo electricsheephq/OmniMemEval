@@ -31,6 +31,13 @@ EXTRAS = [
     {"kind": "summary", "node_id": 12, "session_id": "s1", "window": "summary window", "extra": True},
 ]
 SOURCES = {11: [3, 4, 5], 12: [1, 2]}
+# Captured from the unchanged adapter (b468f655) on this fixture with top_k=4, before the hook.
+_BASE = ("[2023-05-01T09:00:00Z] {r}I adopted a beagle named Biscuit.\n"
+         "[2023-05-08T18:30:00+00:00] (session summary) user: Biscuit turned two.\n"
+         "[2023-05-08T18:30:00+00:00] {r}Biscuit turned two today.")
+_EXTRAS = "\n[2023-05-08T18:30:00+00:00] Happy birthday!\n[2023-05-01T09:00:00+00:00] (session summary) summary window"
+GOLDEN = {(v, x): _BASE.format(r="user: " if v == "2" else "") + (_EXTRAS if x else "")
+          for v in ("1", "2") for x in (False, True)}
 
 
 class FakeDag:
@@ -70,13 +77,16 @@ def _client(monkeypatch, tmp_path, hits, dag=None):
 @pytest.mark.parametrize("extras", [False, True])
 def test_on_and_off_return_identical_text_and_off_writes_nothing(monkeypatch, tmp_path, version, extras):
     monkeypatch.setenv("LCMX_ADAPTER_VERSION", version)
-    monkeypatch.setenv("LCMX_EXTRA_ENTRIES", "1") if extras else monkeypatch.delenv("LCMX_EXTRA_ENTRIES", raising=False)
+    monkeypatch.delenv("LCMX_EXTRA_ENTRIES", raising=False)
+    if extras:
+        monkeypatch.setenv("LCMX_EXTRA_ENTRIES", "1")
     hits = HITS + (EXTRAS if extras else [])
     log = tmp_path / "out" / "delivery.jsonl"
     log.parent.mkdir()
     monkeypatch.delenv("LCMX_DELIVERY_LOG", raising=False)
     dag = FakeDag()
     off = _client(monkeypatch, tmp_path, hits, dag).search("q", "u", 4)
+    assert off == GOLDEN[(version, extras)]  # byte-identical to b468f655
     assert dag.calls == [] and list(log.parent.iterdir()) == []  # off: no lineage read, no file
     monkeypatch.setenv("LCMX_DELIVERY_LOG", str(log))
     assert _client(monkeypatch, tmp_path, hits).search("q", "u", 4) == off
@@ -153,7 +163,8 @@ def test_missing_store_still_writes_an_empty_record(monkeypatch, tmp_path):
     assert json.loads(log.read_text())["lines"] == []
 
 
-@pytest.mark.parametrize("bad", ["relative.jsonl", "{tmp}/delivery.json", "{tmp}/missing/delivery.jsonl", "{tmp}/dir.jsonl"])
+@pytest.mark.parametrize("bad", ["relative.jsonl", "{tmp}/delivery.json", "{tmp}/missing/delivery.jsonl",
+                                 "{tmp}/dir.jsonl"])
 def test_bad_path_fails_at_startup(monkeypatch, tmp_path, bad):
     (tmp_path / "dir.jsonl").mkdir()
     for name, value in (("LCMX_REPO", str(tmp_path)), ("LCMX_DB_ROOT", str(tmp_path / "db")),
