@@ -20,6 +20,9 @@ _HOSTED_PROVIDERS = ("openai-compatible", "openai", "siliconflow")
 _HOSTED_RETRY_DELAYS_S = (1.0, 4.0)  # three attempts in all
 _HOSTED_RETRYABLE = re.compile(r"\((?:429|5\d\d)\)|network error|deadline exceeded|timed out")  # LCM-X error text
 _DOC_RERUN_DELAYS_S = (4.0, 16.0)  # failed document rows: at most two reruns of the product call
+# The only resumable backfill stop: LCM-X stops before claiming the next batch (command.py:3883-3886, 5669-5672).
+# Every other stop (lease_lost, identity_superseded, privacy_refused, process_exit, any new one) is terminal.
+_RESUMABLE_STOPS = (None, "", "op_budget_exhausted")
 _HOSTED_FIXED = ("embedding_privacy_enabled", "embedding_query_prefix", "embedding_document_prefix",
                  "embedding_storage_dtype")  # set by the adapter (privacy off) or by LCM-X's warmup; never overridden
 _sleep = time.sleep
@@ -261,8 +264,8 @@ class LcmxClient:
             self._model = require_env("LCMX_EMBED_MODEL")
             self._base_url = require_env("LCMX_EMBED_BASE_URL")
             require_env("LCM_EMBEDDING_API_KEY")
-            if any(ch.isspace() or not ch.isprintable() for ch in os.environ["LCM_EMBEDDING_API_KEY"]):
-                raise ValueError("LCM_EMBEDDING_API_KEY contains whitespace or a control character")  # never echoed
+            if any(not "\x21" <= ch <= "\x7e" for ch in os.environ["LCM_EMBEDDING_API_KEY"]):
+                raise ValueError("LCM_EMBEDDING_API_KEY must be printable ASCII (0x21-0x7E)")  # never echoed
             self._batch_size = env_int("LCMX_EMBED_BATCH_SIZE", 10, min_value=1)
             fixed = [f for f in _HOSTED_FIXED if f in {i.partition("=")[0].strip() for i in
                                                        (env_str("LCMX_CONFIG_SET", "") or "").split(",")}]
@@ -346,10 +349,9 @@ class LcmxClient:
                 embedding_provider=self._provider_name,
                 embedding_model=self._model,
             )
-            if self._base_url:  # LCM-X's own providers read the same URL and request size; privacy filter off
+            if self._base_url:  # LCM-X's own providers read the same URL and request size
                 config.embedding_base_url = self._base_url
                 config.embedding_max_batch_items = self._batch_size
-                config.embedding_privacy_enabled = False
         # R2 flag arms: LCMX_CONFIG_SET="field=value,field=value" sets LCM-X config fields
         # (bool/int/float/str coerced from the field's default). Unknown fields abort.
         for item in filter(None, (env_str("LCMX_CONFIG_SET", "") or "").split(",")):
@@ -375,6 +377,8 @@ class LcmxClient:
                 _CONFIG_SET_LOGGED.add(key)
                 print(f"[lcmx] LCMX_CONFIG_SET applied: {name}={value!r} adapter_version={_adapter_version()}",
                       file=sys.stderr)
+        if self._embeddings and self._base_url:  # privacy filter off, applied after every override
+            config.embedding_privacy_enabled = False
         return config
 
     def _open(self, user_id):
@@ -453,10 +457,6 @@ class LcmxClient:
                 store_ids = store.append_batch(
                     session_id, rows_in, source="benchmark", conversation_id=session_id
                 )
-                if self._base_url:  # A3: hosted embeds the stored text, which LCM-X may externalize at ingest
-                    stored = store.get_batch(store_ids)
-                    self._rewritten_rows(user_id, sum((stored.get(i) or {}).get("content") != r["content"]
-                                                      for i, r in zip(store_ids, rows_in)))
                 summary_text = self._summary(
                     [{"role": r["role"], "content": r["content"]} for r in rows_in]
                 )
@@ -555,7 +555,7 @@ class LcmxClient:
                 self._hosted_register(user_id, config)
                 if not hasattr(lcm_tools, "_lcm_recall_catchup_reason"):
                     _abort("LCM-X hosted embeddings need a tree with catch-up receipts (no_receipt_gate)", rebuild=True)
-                report["ingest_rewritten_rows_store"] = self._rewritten_rows(user_id)
+                report["externalized_payload_rows_store"] = self._externalized_payload_rows(user_id)
             except Exception as exc:  # noqa: BLE001 - the same clean abort as the catch-up
                 _abort(f"LCM-X embedding catch-up failed: {type(exc).__name__}", rebuild=True)
         if not hasattr(lcm_tools, "_lcm_recall_catchup_reason") or not self._embeddings:
@@ -648,7 +648,7 @@ class LcmxClient:
             _sleep(delay)
             result = command._embedding_backfill_summary_run(config, db, apply=True, limit=self._batch_size,
                                                              retry_uncertain=True)
-            if isinstance(result, str) or result.get("error"):
+            if isinstance(result, str) or result.get("error") or result.get("stop_reason") not in _RESUMABLE_STOPS:
                 return "summaries=error"
             reran, embedded = True, embedded + int(result.get("embedded") or 0)
 
@@ -665,7 +665,7 @@ class LcmxClient:
                                                  retry_uncertain=delay > 0, confirm_raw_text=True, incremental=True)
             # A4: an error, refusal, stop or (filter off, so unexpected) withheld chunk in any call is kept.
             if isinstance(result, str) or result.get("error") or result.get("privacy_withheld") \
-                    or result.get("stop_reason") not in (None, "op_budget_exhausted"):
+                    or result.get("stop_reason") not in _RESUMABLE_STOPS:
                 errors.append(result if isinstance(result, str) else {
                     k: result.get(k) for k in ("error", "stop_reason", "privacy_withheld")})
             if errors or not result.get("failed"):
@@ -676,19 +676,22 @@ class LcmxClient:
             return "error"
         return f"{'partial' if result.get('remaining') else 'complete'}:{embedded + int(result.get('embedded') or 0)}"
 
-    def _rewritten_rows(self, user_id, new=0):
-        """A3: rows LCM-X stored differently from the ingested text (a very large turn is externalized to a
-        placeholder); hosted backfill embeds the stored text, the local arm the original. Per-store count."""
-        path = self._user_dir(user_id) / "ingest_rewritten_rows.json"
-        count = new + (json.loads(path.read_text()) if path.exists() else 0)
-        if not new:
-            return count
-        atomic_json_dump(count, path)
-        if "rewritten" not in _CONFIG_SET_LOGGED:
-            _CONFIG_SET_LOGGED.add("rewritten")
-            print(f"[lcmx] WARNING: LCM-X stored {count} row(s) in store {_safe(user_id)} differently from the ingested "
-                  "text (externalized); hosted embeds the stored text; per-store count in embedding_catchup.json",
-                  file=sys.stderr)
+    def _externalized_payload_rows(self, user_id):
+        """A3: read-only count of the store's message rows holding an LCM-X externalized-payload placeholder (a
+        quarantined base64 blob, alone or inline, or a very large turn). Hosted backfill embeds that stored text;
+        the local arm embeds the original. Matched with LCM-X's own placeholder patterns (ingest_content.py:90,
+        prefix constant at :77; externalize.py:36)."""
+        from hermes_lcm.externalize import _EXTERNALIZED_REF_RE
+        from hermes_lcm.ingest_content import _INGEST_PLACEHOLDER_RE
+
+        with closing(sqlite3.connect(f"{self._db_path(user_id).resolve().as_uri()}?mode=ro", uri=True)) as conn:
+            rows = conn.execute("SELECT content FROM messages WHERE content LIKE '%xternalized%'").fetchall()
+        count = sum(bool(_INGEST_PLACEHOLDER_RE.search(text) or _EXTERNALIZED_REF_RE.search(text))
+                    for (text,) in rows if isinstance(text, str))
+        if count and "externalized" not in _CONFIG_SET_LOGGED:
+            _CONFIG_SET_LOGGED.add("externalized")
+            print(f"[lcmx] WARNING: {count} externalized payload rows in store {_safe(user_id)}: hosted embeds LCM-X's "
+                  "placeholder, not the original text; per-store count in embedding_catchup.json", file=sys.stderr)
         return count
 
     def set_search_results_dir(self, path):
